@@ -1,0 +1,63 @@
+[package]
+name = "op-succinct-host-utils"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+# sp1
+sp1-sdk.workspace = true
+
+# local
+op-succinct-client-utils.workspace = true
+
+# op-alloy
+op-alloy-network.workspace = true
+op-alloy-consensus.workspace = true
+
+# kona
+kona-genesis.workspace = true
+kona-protocol.workspace = true
+kona-rpc.workspace = true
+kona-host.workspace = true
+kona-preimage.workspace = true
+kona-proof.workspace = true
+kona-derive.workspace = true
+
+# hana
+hana-host = { workspace = true, optional = true }
+
+# alloy
+alloy-contract.workspace = true
+alloy-provider.workspace = true
+alloy-rlp.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-sol-types.workspace = true
+alloy-eips.workspace = true
+alloy-rpc-types.workspace = true
+
+# general
+rkyv.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+serde_cbor.workspace = true
+futures.workspace = true
+num-format.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+strum.workspace = true
+metrics.workspace = true
+metrics-process.workspace = true
+metrics-exporter-prometheus.workspace = true
+cfg-if.workspace = true
+
+kzg-rs.workspace = true
+c-kzg.workspace = true
+
+[features]
+default = []
+celestia = ["hana-host"]
