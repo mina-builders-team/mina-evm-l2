@@ -1,4 +1,5 @@
 import {
+	type DeployArgs,
 	Field,
 	Permissions,
 	SelfProof,
@@ -14,7 +15,37 @@ export class RollupState extends Struct({
 	latestL2StateRoot: Field,
 	latestProofCommitment: Field,
 	latestDACommitment: Field,
-}) {}
+}) {
+	static createEmpty() {
+		return new RollupState({
+			latestL2StateRoot: Field(0),
+			latestProofCommitment: Field(0),
+			latestDACommitment: Field(0),
+		});
+	}
+
+	static assertEquals(state1: RollupState, state2: RollupState) {
+		state1.latestL2StateRoot.assertEquals(state2.latestL2StateRoot);
+		state1.latestProofCommitment.assertEquals(state2.latestProofCommitment);
+		state1.latestDACommitment.assertEquals(state2.latestDACommitment);
+	}
+
+	static createFromInputs(inputs: InitialStateInputs) {
+		return new RollupState({
+			latestL2StateRoot: inputs.initialL2StateRoot,
+			latestProofCommitment: inputs.initialProofCommitment,
+			latestDACommitment: inputs.initialDACommitment,
+		});
+	}
+
+	static createFromExternalInputs(externalInputs: ExternalProofInputs) {
+		return new RollupState({
+			latestL2StateRoot: externalInputs.newProposedL2StateRoot,
+			latestProofCommitment: externalInputs.newExternalProofCommitment,
+			latestDACommitment: externalInputs.dataAvailabilityCommitment,
+		});
+	}
+}
 
 export class ExternalProofInputs extends Struct({
 	previousL2StateRoot: Field,
@@ -46,36 +77,11 @@ export const StateTransitionVerifier = ZkProgram({
 				initialState: InitialStateInputs,
 			) {
 				// The previous state for initialization is the zero state
-				const emptyState = new RollupState({
-					latestL2StateRoot: Field(0),
-					latestProofCommitment: Field(0),
-					latestDACommitment: Field(0),
-				});
-				transition.previousState.latestL2StateRoot.assertEquals(
-					emptyState.latestL2StateRoot,
-				);
-				transition.previousState.latestProofCommitment.assertEquals(
-					emptyState.latestProofCommitment,
-				);
-				transition.previousState.latestDACommitment.assertEquals(
-					emptyState.latestDACommitment,
-				);
+				const emptyState = RollupState.createEmpty();
+				RollupState.assertEquals(transition.previousState, emptyState);
 
-				const newInitialState = new RollupState({
-					latestL2StateRoot: initialState.initialL2StateRoot,
-					latestProofCommitment: initialState.initialProofCommitment,
-					latestDACommitment: initialState.initialDACommitment,
-				});
-
-				transition.newState.latestL2StateRoot.assertEquals(
-					newInitialState.latestL2StateRoot,
-				);
-				transition.newState.latestProofCommitment.assertEquals(
-					newInitialState.latestProofCommitment,
-				);
-				transition.newState.latestDACommitment.assertEquals(
-					newInitialState.latestDACommitment,
-				);
+				const newInitialState = RollupState.createFromInputs(initialState);
+				RollupState.assertEquals(transition.newState, newInitialState);
 			},
 		},
 
@@ -89,14 +95,9 @@ export const StateTransitionVerifier = ZkProgram({
 				previousStateProof.verify();
 
 				const previousStateFromProof = previousStateProof.publicInput.newState;
-				transition.previousState.latestL2StateRoot.assertEquals(
-					previousStateFromProof.latestL2StateRoot,
-				);
-				transition.previousState.latestProofCommitment.assertEquals(
-					previousStateFromProof.latestProofCommitment,
-				);
-				transition.previousState.latestDACommitment.assertEquals(
-					previousStateFromProof.latestDACommitment,
+				RollupState.assertEquals(
+					transition.previousState,
+					previousStateFromProof,
 				);
 
 				const currentState = transition.previousState;
@@ -112,21 +113,9 @@ export const StateTransitionVerifier = ZkProgram({
 				// 2. External Proof Verification (TODO):
 				// This is where the ZkProgram would cryptographically verify
 				// the actual external ZK proof and perform consistency checks.
-				const computedNewState = new RollupState({
-					latestL2StateRoot: externalInputs.newProposedL2StateRoot,
-					latestProofCommitment: externalInputs.newExternalProofCommitment,
-					latestDACommitment: externalInputs.dataAvailabilityCommitment,
-				});
-
-				transition.newState.latestL2StateRoot.assertEquals(
-					computedNewState.latestL2StateRoot,
-				);
-				transition.newState.latestProofCommitment.assertEquals(
-					computedNewState.latestProofCommitment,
-				);
-				transition.newState.latestDACommitment.assertEquals(
-					computedNewState.latestDACommitment,
-				);
+				const computedNewState =
+					RollupState.createFromExternalInputs(externalInputs);
+				RollupState.assertEquals(transition.newState, computedNewState);
 			},
 		},
 	},
@@ -141,32 +130,45 @@ export class SettlementContract extends SmartContract {
 	@state(Field) latestProofCommitment = State<Field>();
 	@state(Field) latestDACommitment = State<Field>();
 
-	init() {
-		super.init();
-		this.latestL2StateRoot.set(Field(0));
-		this.latestProofCommitment.set(Field(0));
-		this.latestDACommitment.set(Field(0));
-
+	async deploy(args: DeployArgs) {
+		await super.deploy(args);
 		this.account.permissions.set({
 			...Permissions.default(),
-			editState: Permissions.proof(),
+			editState: Permissions.proofOrSignature(),
 		});
 	}
 
-	@method async update(proof: StateTransitionProof) {
+	@method async initializeState(initialState: InitialStateInputs) {
+		// Ensure we're starting from zero state
 		const currentL2StateRoot = this.latestL2StateRoot.getAndRequireEquals();
 		const currentProofCommitment =
 			this.latestProofCommitment.getAndRequireEquals();
 		const currentDACommitment = this.latestDACommitment.getAndRequireEquals();
 
-		const previousState = proof.publicInput.previousState;
+		currentL2StateRoot.assertEquals(Field(0));
+		currentProofCommitment.assertEquals(Field(0));
+		currentDACommitment.assertEquals(Field(0));
 
-		previousState.latestL2StateRoot.assertEquals(currentL2StateRoot);
-		previousState.latestProofCommitment.assertEquals(currentProofCommitment);
-		previousState.latestDACommitment.assertEquals(currentDACommitment);
+		this.latestL2StateRoot.set(initialState.initialL2StateRoot);
+		this.latestProofCommitment.set(initialState.initialProofCommitment);
+		this.latestDACommitment.set(initialState.initialDACommitment);
+	}
 
+	@method async update(proof: StateTransitionProof) {
+		// Get current on-chain state
+		const currentState = new RollupState({
+			latestL2StateRoot: this.latestL2StateRoot.getAndRequireEquals(),
+			latestProofCommitment: this.latestProofCommitment.getAndRequireEquals(),
+			latestDACommitment: this.latestDACommitment.getAndRequireEquals(),
+		});
+
+		// Verify proof is based on current on-chain state
+		RollupState.assertEquals(proof.publicInput.previousState, currentState);
+
+		// Verify the proof
 		proof.verify();
 
+		// Update to new state
 		const newState = proof.publicInput.newState;
 		this.latestL2StateRoot.set(newState.latestL2StateRoot);
 		this.latestProofCommitment.set(newState.latestProofCommitment);

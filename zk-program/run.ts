@@ -6,7 +6,7 @@ import {
 	SettlementContract,
 	StateTransition,
 	StateTransitionVerifier,
-} from "./index";
+} from "./index.js";
 
 async function run() {
 	console.log("Starting script...");
@@ -30,7 +30,7 @@ async function run() {
 	console.log("Deploying contract...");
 	const txn = await Mina.transaction(deployerAccount, async () => {
 		AccountUpdate.fundNewAccount(deployerAccount);
-		await zkApp.deploy();
+		await zkApp.deploy({});
 	});
 	await txn.prove();
 	await txn.sign([deployerKey, zkAppAddress]).send();
@@ -41,25 +41,31 @@ async function run() {
 		zkApp.latestL2StateRoot.get().toString(),
 	);
 
-	// 1. Create the initial proof (base case)
-	console.log("Creating initial proof...");
+	// 1. Initialize the contract state
+	console.log("Initializing contract state...");
 	const initialStateInputs = new InitialStateInputs({
 		initialL2StateRoot: Field(100),
 		initialProofCommitment: Field(101),
 		initialDACommitment: Field(102),
 	});
 
+	const initTxn = await Mina.transaction(senderAccount, async () => {
+		await zkApp.initializeState(initialStateInputs);
+	});
+	await initTxn.prove();
+	await initTxn.sign([senderKey]).send();
+	console.log("Contract state initialized.");
+
+	console.log(
+		"On-chain state after initialization (L2 State Root):",
+		zkApp.latestL2StateRoot.get().toString(),
+	);
+
+	// 2. Create the initial proof (base case)
+	console.log("Creating initial proof...");
 	const initialTransition = new StateTransition({
-		previousState: new RollupState({
-			latestL2StateRoot: Field(0),
-			latestProofCommitment: Field(0),
-			latestDACommitment: Field(0),
-		}),
-		newState: new RollupState({
-			latestL2StateRoot: initialStateInputs.initialL2StateRoot,
-			latestProofCommitment: initialStateInputs.initialProofCommitment,
-			latestDACommitment: initialStateInputs.initialDACommitment,
-		}),
+		previousState: RollupState.createEmpty(),
+		newState: RollupState.createFromInputs(initialStateInputs),
 	});
 
 	const proof0 = await StateTransitionVerifier.initialize(
@@ -67,20 +73,6 @@ async function run() {
 		initialStateInputs,
 	);
 	console.log("Initial proof created.");
-
-	// 2. Update the contract with the initial proof
-	console.log("Updating contract with initial proof...");
-	let updateTxn = await Mina.transaction(senderAccount, async () => {
-		await zkApp.update(proof0.proof);
-	});
-	await updateTxn.prove();
-	await updateTxn.sign([senderKey]).send();
-	console.log("Contract updated with initial proof.");
-
-	console.log(
-		"On-chain state after 1st update (L2 State Root):",
-		zkApp.latestL2StateRoot.get().toString(),
-	);
 
 	// 3. Create a subsequent proof (recursive step)
 	console.log("Creating subsequent proof...");
@@ -94,11 +86,7 @@ async function run() {
 
 	const subsequentTransition = new StateTransition({
 		previousState: initialTransition.newState, // The new state from the last transition
-		newState: new RollupState({
-			latestL2StateRoot: externalInputs.newProposedL2StateRoot,
-			latestProofCommitment: externalInputs.newExternalProofCommitment,
-			latestDACommitment: externalInputs.dataAvailabilityCommitment,
-		}),
+		newState: RollupState.createFromExternalInputs(externalInputs),
 	});
 
 	const proof1 = await StateTransitionVerifier.updateState(
@@ -110,7 +98,7 @@ async function run() {
 
 	// 4. Update the contract with the subsequent proof
 	console.log("Updating contract with subsequent proof...");
-	updateTxn = await Mina.transaction(senderAccount, async () => {
+	const updateTxn = await Mina.transaction(senderAccount, async () => {
 		await zkApp.update(proof1.proof);
 	});
 	await updateTxn.prove();
