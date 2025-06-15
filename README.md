@@ -1,8 +1,26 @@
-# Mina ZK Rollup for EVM Compatibility
+# EVM Layer-2 on Mina
 
 This project implements a ZK rollup solution to enable EVM-compatible smart contracts on Mina Protocol. It uses `op-succinct` for EVM execution and proof generation, with proof conversion to Mina's Kimchi proving system via Nori-zk.
 
 This project is a work in progress and is not yet ready for production.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+  - [System Requirements](#system-requirements)
+- [Installation](#installation)
+  - [Base Dependencies](#base-dependencies)
+  - [Project Dependencies](#project-dependencies)
+- [Running the Network locally](#running-the-network-locally)
+- [AWS ARM Setup](#aws-arm-setup)
+- [Testing the Network](#testing-the-network)
+- [Environment Variables](#environment-variables)
+  - [op-succinct](#op-succinct)
+- [Architecture Details](#architecture-details)
+- [Dependencies](#dependencies)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Overview
 
