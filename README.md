@@ -2,6 +2,8 @@
 
 This project implements a ZK rollup solution to enable EVM-compatible smart contracts on Mina Protocol. It uses `op-succinct` for EVM execution and proof generation, with proof conversion to Mina's Kimchi proving system via Nori-zk.
 
+The current blog post can be found [here](blog_post.md).
+
 This project is a work in progress and is not yet ready for production.
 
 ## Overview
