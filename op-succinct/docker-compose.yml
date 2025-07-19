@@ -18,9 +18,32 @@ services:
       - ${ENV_FILE:-.env}
     environment:
       - DATABASE_URL=postgres://op-succinct@postgres:5432/op-succinct
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - postgres
     restart: unless-stopped
+    volumes:
+      - ../data:/data
+
+  proof-conversion-service:
+    build:
+      context: .
+      dockerfile: ./proof-conversion/Dockerfile
+    env_file:
+      - ${ENV_FILE:-.env}
+    environment:
+      - DATABASE_URL=postgres://op-succinct@postgres:5432/op-succinct
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - postgres
+      - op-succinct
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../data:/data
 
 volumes:
   postgres-data:
