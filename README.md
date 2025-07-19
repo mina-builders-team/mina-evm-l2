@@ -58,7 +58,7 @@ nvm install --lts
 nvm use --lts
 
 # Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 
 # Install SP1
@@ -69,10 +69,10 @@ sp1up
 # Install Docker
 sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
+sudo add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable"
 apt-cache policy docker-ce
 sudo apt install -y docker-ce
-sudo systemctl status docker
+sudo systemctl start docker
 
 # Install Kurtosis
 echo "deb [trusted=yes] https://apt.fury.io/kurtosis-tech/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
@@ -86,7 +86,7 @@ sudo apt-get install -y numactl
 
 ```bash
 # Install required system packages
-sudo apt-get update && apt-get install -y \
+sudo apt-get install -y \
     curl \
     jq \
     clang \
@@ -94,12 +94,21 @@ sudo apt-get update && apt-get install -y \
     git \
     pkg-config \
     libssl-dev
+
+# Install just
+snap install --edge --classic just
+
+# Install foundry
+curl -L https://foundry.paradigm.xyz | bash
+source /root/.bashrc
+foundryup
 ```
 
 ## Running the Network locally
 
 ```bash
-kurtosis run --enclave my-testnet github.com/ethpandaops/optimism-package --args-file op-network.yaml --image-download always
+cd op-succinct
+kurtosis run --enclave my-testnet github.com/ethpandaops/optimism-package@452133367b693e3ba22214a6615c86c60a1efd5e --args-file op-network.yaml --image-download always
 ```
 
 ## AWS ARM Setup

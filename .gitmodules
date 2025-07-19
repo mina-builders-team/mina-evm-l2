@@ -9,7 +9,7 @@
 	url = https://github.com/openzeppelin/openzeppelin-contracts
 [submodule "op-succinct/contracts/lib/sp1-contracts"]
 	path = op-succinct/contracts/lib/sp1-contracts
-	url = https://github.com/zobront/sp1-contracts
+	url = https://github.com/succinctlabs/sp1-contracts
 [submodule "op-succinct/contracts/lib/solady"]
 	path = op-succinct/contracts/lib/solady
 	url = https://github.com/vectorized/solady
