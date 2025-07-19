@@ -28,8 +28,8 @@ services:
 
   proof-conversion-service:
     build:
-      context: .
-      dockerfile: ./proof-conversion/Dockerfile
+      context: ./proof-conversion-service
+      dockerfile: Dockerfile
     env_file:
       - ${ENV_FILE:-.env}
     environment:
