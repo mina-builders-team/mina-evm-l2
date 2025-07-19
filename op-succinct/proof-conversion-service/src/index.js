@@ -1,6 +1,8 @@
 import chokidar from 'chokidar';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { ComputationalPlanExecutor, performSp1ToPlonk } from '@nori-zk/proof-conversion';
 
 const SAVED_PROOFS_DIR = '/data/saved_proofs';
@@ -101,51 +103,47 @@ class ProofConversionService {
 
   async parseProofFile(filePath) {
     try {
-      const fileBuffer = await fs.readFile(filePath);
       const fileName = path.basename(filePath);
 
-      // Extract block range from filename (format: start_block_end_block.bin)
-      const match = fileName.match(/^(\d+)_(\d+)\.bin$/);
+      // Extract block range from filename (format: start_block-end_block.bin)
+      const match = fileName.match(/^(\d+)-(\d+)\.bin$/);
       if (!match) {
         throw new Error(`Invalid filename format: ${fileName}`);
       }
 
       const [, startBlock, endBlock] = match;
 
-      // The .bin file contains SP1 proof bytes
-      // For now, we'll attempt to parse it as a JSON-compatible structure
-      // In a real implementation, you'd need to properly deserialize the SP1Proof
+      // Create temporary output file for the JSON conversion
+      const tempOutputPath = `/tmp/${fileName.replace('.bin', '_parsed.json')}`;
 
-      // This is a simplified approach - in practice you'd need to:
-      // 1. Determine if it's a compressed proof (bincode) or raw bytes
-      // 2. Parse accordingly to extract the SP1ProofWithPublicValues
-      // 3. Convert to the expected Sp1 format for nori-zk
+      // Call the Rust binary to convert SP1 proof to JSON
+      const execFileAsync = promisify(execFile);
 
-      console.log(`📊 Proof file size: ${fileBuffer.length} bytes`);
-      console.log(`📋 Block range: ${startBlock} - ${endBlock}`);
+      console.log(`🔄 Converting ${fileName} using sp1-proof-to-json binary...`);
+      
+      try {
+        await execFileAsync('/usr/local/bin/sp1-proof-to-json', [
+          '-i', filePath,
+          '-o', tempOutputPath
+        ]);
+      } catch (execError) {
+        // Fallback to relative path if absolute path fails
+        await execFileAsync('./target/release/sp1-proof-to-json', [
+          '-i', filePath, 
+          '-o', tempOutputPath
+        ]);
+      }
 
-      // For now, return a placeholder structure
-      // TODO: Implement proper SP1 proof parsing from binary format
-      const sp1ProofStructure = {
-        proof: {
-          Plonk: {
-            encoded_proof: fileBuffer.toString('hex'),
-            public_inputs: [`0x${'0'.repeat(64)}`] // Placeholder VK
-          }
-        },
-        public_values: {
-          buffer: {
-            data: Array.from(fileBuffer.slice(0, Math.min(32, fileBuffer.length)))
-          }
-        },
-        metadata: {
-          startBlock: parseInt(startBlock),
-          endBlock: parseInt(endBlock),
-          originalSize: fileBuffer.length
-        }
-      };
+      // Read the converted JSON
+      const jsonData = await fs.readFile(tempOutputPath, 'utf8');
+      const parsedProof = JSON.parse(jsonData);
 
-      return sp1ProofStructure;
+      // Clean up temporary file
+      await fs.unlink(tempOutputPath).catch(() => {}); // Ignore cleanup errors
+
+      console.log(`✅ Successfully parsed ${fileName} (${startBlock}-${endBlock})`);
+      return parsedProof;
+
     } catch (error) {
       console.error(`Failed to parse proof file ${filePath}:`, error);
       return null;
