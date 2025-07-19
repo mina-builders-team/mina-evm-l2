@@ -2,36 +2,31 @@ pub mod config;
 pub mod contract;
 pub mod prometheus;
 pub mod proposer;
-pub mod utils;
 
 use alloy_eips::BlockNumberOrTag;
-use alloy_network::Ethereum;
 use alloy_primitives::{address, keccak256, Address, FixedBytes, B256, U256};
-use alloy_provider::{
-    fillers::{FillProvider, TxFiller},
-    Provider, RootProvider,
-};
+use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::Block;
 use alloy_sol_types::SolValue;
+use alloy_transport_http::reqwest::Url;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
-use tokio::time::Duration;
+use op_succinct_signer_utils::Signer;
 
 use crate::{
     contract::{
         AnchorStateRegistry, DisputeGameFactory::DisputeGameFactoryInstance, GameStatus, L2Output,
         OPSuccinctFaultDisputeGame, ProposalStatus,
     },
-    prometheus::ProposerGauge,
+    prometheus::{ChallengerGauge, ProposerGauge},
 };
 use op_succinct_host_utils::metrics::MetricsGauge;
 
 pub type L1Provider = RootProvider;
 pub type L2Provider = RootProvider<Optimism>;
 pub type L2NodeProvider = RootProvider<Optimism>;
-pub type L1ProviderWithWallet<F, P> = FillProvider<F, P, Ethereum>;
 
 pub const NUM_CONFIRMATIONS: u64 = 3;
 pub const TIMEOUT_SECONDS: u64 = 60;
@@ -124,9 +119,8 @@ impl L2ProviderTrait for L2Provider {
 }
 
 #[async_trait]
-pub trait FactoryTrait<F, P>
+pub trait FactoryTrait<P>
 where
-    F: TxFiller,
     P: Provider + Clone,
 {
     /// Fetches the bond required to create a game.
@@ -238,7 +232,9 @@ where
         &self,
         index: U256,
         mode: Mode,
-        l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
+        signer: Signer,
+        l1_rpc: Url,
+        l1_provider: L1Provider,
         l2_provider: L2Provider,
     ) -> Result<Action>;
 
@@ -248,15 +244,16 @@ where
         &self,
         mode: Mode,
         max_games_to_check_for_resolution: u64,
-        l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
+        signer: Signer,
+        l1_rpc: Url,
+        l1_provider: L1Provider,
         l2_provider: L2Provider,
     ) -> Result<()>;
 }
 
 #[async_trait]
-impl<F, P> FactoryTrait<F, P> for DisputeGameFactoryInstance<L1ProviderWithWallet<F, P>>
+impl<P> FactoryTrait<P> for DisputeGameFactoryInstance<P>
 where
-    F: TxFiller,
     P: Provider + Clone,
 {
     /// Fetches the bond required to create a game.
@@ -304,7 +301,7 @@ where
     ) -> Result<Option<(U256, U256)>> {
         // Get latest game index, return None if no games exist.
         let Some(mut game_index) = self.fetch_latest_game_index().await? else {
-            tracing::info!("No games exist yet");
+            tracing::info!("No games exist yet for finding latest valid proposal");
             return Ok(None);
         };
 
@@ -550,7 +547,7 @@ where
         let latest_game_index = match self.fetch_latest_game_index().await? {
             Some(index) => index,
             None => {
-                tracing::info!("No games exist yet");
+                tracing::info!("No games exist yet for bond claiming");
                 return Ok(None);
             }
         };
@@ -605,11 +602,13 @@ where
         &self,
         index: U256,
         mode: Mode,
-        l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
+        signer: Signer,
+        l1_rpc: Url,
+        l1_provider: L1Provider,
         l2_provider: L2Provider,
     ) -> Result<Action> {
         let game_address = self.fetch_game_address_by_index(index).await?;
-        let game = OPSuccinctFaultDisputeGame::new(game_address, l1_provider_with_wallet.clone());
+        let game = OPSuccinctFaultDisputeGame::new(game_address, l1_provider);
         if game.status().call().await? != GameStatus::IN_PROGRESS {
             tracing::info!(
                 "Game {:?} at index {:?} is not in progress, not attempting resolution",
@@ -657,14 +656,8 @@ where
         }
 
         let contract = OPSuccinctFaultDisputeGame::new(game_address, self.provider());
-        let receipt = contract
-            .resolve()
-            .send()
-            .await?
-            .with_required_confirmations(NUM_CONFIRMATIONS)
-            .with_timeout(Some(Duration::from_secs(TIMEOUT_SECONDS)))
-            .get_receipt()
-            .await?;
+        let transaction_request = contract.resolve().into_transaction_request();
+        let receipt = signer.send_transaction_request(l1_rpc, transaction_request).await?;
         tracing::info!(
             "\x1b[1mSuccessfully resolved game {:?} at index {:?} with tx {:?}\x1b[0m",
             game_address,
@@ -675,11 +668,25 @@ where
     }
 
     /// Attempts to resolve games, up to `max_games_to_check_for_resolution`.
+    #[tracing::instrument(
+        name = "[[Resolving]]",
+        skip(
+            self,
+            mode,
+            max_games_to_check_for_resolution,
+            signer,
+            l1_rpc,
+            l1_provider,
+            l2_provider
+        )
+    )]
     async fn resolve_games(
         &self,
         mode: Mode,
         max_games_to_check_for_resolution: u64,
-        l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
+        signer: Signer,
+        l1_rpc: Url,
+        l1_provider: L1Provider,
         l2_provider: L2Provider,
     ) -> Result<()> {
         // Find latest game index, return early if no games exist.
@@ -704,12 +711,18 @@ where
                     .try_resolve_games(
                         index,
                         mode,
-                        l1_provider_with_wallet.clone(),
+                        signer.clone(),
+                        l1_rpc.clone(),
+                        l1_provider.clone(),
                         l2_provider.clone(),
                     )
                     .await
                 {
-                    ProposerGauge::GamesResolved.increment(1.0);
+                    // Use mode-specific metrics to avoid cross-contamination
+                    match mode {
+                        Mode::Proposer => ProposerGauge::GamesResolved.increment(1.0),
+                        Mode::Challenger => ChallengerGauge::GamesResolved.increment(1.0),
+                    }
                 }
             }
         } else {

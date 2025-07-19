@@ -1,29 +1,60 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use alloy_network::Ethereum;
 use alloy_primitives::{Address, TxHash, U256};
-use alloy_provider::{fillers::TxFiller, Provider, ProviderBuilder};
-use alloy_sol_types::SolValue;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_sol_types::{SolEvent, SolValue};
 use anyhow::{Context, Result};
+use op_succinct_client_utils::boot::BootInfoStruct;
+use op_succinct_elfs::AGGREGATION_ELF;
+use op_succinct_host_utils::{
+    fetcher::OPSuccinctDataFetcher, get_agg_proof_stdin, host::OPSuccinctHost,
+    metrics::MetricsGauge, witness_generation::WitnessGenerator,
+};
+use op_succinct_proof_utils::get_range_elf_embedded;
+use op_succinct_signer_utils::Signer;
 use sp1_sdk::{
     network::FulfillmentStrategy, NetworkProver, Prover, ProverClient, SP1ProofMode,
     SP1ProofWithPublicValues, SP1ProvingKey, SP1VerifyingKey, SP1_CIRCUIT_VERSION,
 };
-use tokio::time;
+use tokio::{sync::Mutex, time};
 
 use crate::{
     config::ProposerConfig,
-    contract::{DisputeGameFactory::DisputeGameFactoryInstance, OPSuccinctFaultDisputeGame},
+    contract::{
+        DisputeGameFactory::{DisputeGameCreated, DisputeGameFactoryInstance},
+        OPSuccinctFaultDisputeGame,
+    },
     prometheus::ProposerGauge,
-    Action, FactoryTrait, L1ProviderWithWallet, L2Provider, L2ProviderTrait, Mode,
-    NUM_CONFIRMATIONS, TIMEOUT_SECONDS,
-};
-use op_succinct_client_utils::boot::BootInfoStruct;
-use op_succinct_host_utils::{
-    fetcher::OPSuccinctDataFetcher, get_agg_proof_stdin, get_proof_stdin, get_range_elf_embedded,
-    hosts::OPSuccinctHost, metrics::MetricsGauge, AGGREGATION_ELF,
+    Action, FactoryTrait, L1Provider, L2Provider, L2ProviderTrait, Mode,
 };
 
+/// Type alias for task ID
+pub type TaskId = u64;
+
+/// Type alias for task handles
+pub type TaskHandle = tokio::task::JoinHandle<Result<()>>;
+
+/// Type alias for a map of task IDs to their join handles and associated task info
+pub type TaskMap = HashMap<TaskId, (TaskHandle, TaskInfo)>;
+
+/// Information about a running task
+#[derive(Clone, Debug)]
+pub enum TaskInfo {
+    GameCreation { block_number: U256 },
+    GameProving { game_address: Address },
+    GameResolution,
+    BondClaim,
+}
+
+#[derive(Clone)]
 struct SP1Prover {
     network_prover: Arc<NetworkProver>,
     range_pk: Arc<SP1ProvingKey>,
@@ -31,37 +62,41 @@ struct SP1Prover {
     agg_pk: Arc<SP1ProvingKey>,
 }
 
-pub struct OPSuccinctProposer<F, P, H: OPSuccinctHost>
+#[derive(Clone)]
+pub struct OPSuccinctProposer<P, H: OPSuccinctHost>
 where
-    F: TxFiller<Ethereum> + Send + Sync,
-    P: Provider<Ethereum> + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
+    H: OPSuccinctHost + Clone + Send + Sync + 'static,
 {
     pub config: ProposerConfig,
     // The address being committed to when generating the aggregation proof to prevent
     // front-running attacks. This should be the same address that is being used to send
     // `prove` transactions.
     pub prover_address: Address,
-    pub l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
+    pub signer: Signer,
+    pub l1_provider: L1Provider,
     pub l2_provider: L2Provider,
-    pub factory: Arc<DisputeGameFactoryInstance<L1ProviderWithWallet<F, P>>>,
+    pub factory: Arc<DisputeGameFactoryInstance<P>>,
     pub init_bond: U256,
     pub safe_db_fallback: bool,
     prover: SP1Prover,
     fetcher: Arc<OPSuccinctDataFetcher>,
     host: Arc<H>,
+    tasks: Arc<Mutex<TaskMap>>,
+    next_task_id: Arc<AtomicU64>,
 }
 
-impl<F, P, H: OPSuccinctHost> OPSuccinctProposer<F, P, H>
+impl<P, H> OPSuccinctProposer<P, H>
 where
-    F: TxFiller<Ethereum> + Send + Sync,
-    P: Provider<Ethereum> + Clone + Send + Sync,
+    P: Provider + Clone + Send + Sync + 'static,
+    H: OPSuccinctHost + Clone + Send + Sync + 'static,
 {
     /// Creates a new challenger instance with the provided L1 provider with wallet and factory
     /// contract instance.
     pub async fn new(
         prover_address: Address,
-        l1_provider_with_wallet: L1ProviderWithWallet<F, P>,
-        factory: DisputeGameFactoryInstance<L1ProviderWithWallet<F, P>>,
+        signer: Signer,
+        factory: DisputeGameFactoryInstance<P>,
         fetcher: Arc<OPSuccinctDataFetcher>,
         host: Arc<H>,
     ) -> Result<Self> {
@@ -83,7 +118,8 @@ where
         Ok(Self {
             config: config.clone(),
             prover_address,
-            l1_provider_with_wallet: l1_provider_with_wallet.clone(),
+            signer,
+            l1_provider: ProviderBuilder::default().connect_http(config.l1_rpc.clone()),
             l2_provider: ProviderBuilder::default().connect_http(config.l2_rpc),
             factory: Arc::new(factory.clone()),
             init_bond: factory.fetch_init_bond(config.game_type).await?,
@@ -96,10 +132,15 @@ where
             },
             fetcher: fetcher.clone(),
             host,
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            next_task_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
+    #[tracing::instrument(name = "[[Proving]]", skip(self), fields(game_address = ?game_address))]
     pub async fn prove_game(&self, game_address: Address) -> Result<TxHash> {
+        tracing::info!("Attempting to prove game {:?}", game_address);
+
         let fetcher = match OPSuccinctDataFetcher::new_with_rollup_config().await {
             Ok(f) => f,
             Err(e) => {
@@ -108,8 +149,7 @@ where
             }
         };
 
-        let game =
-            OPSuccinctFaultDisputeGame::new(game_address, self.l1_provider_with_wallet.clone());
+        let game = OPSuccinctFaultDisputeGame::new(game_address, self.l1_provider.clone());
         let l1_head_hash = game.l1Head().call().await?.0;
         tracing::debug!("L1 head hash: {:?}", hex::encode(l1_head_hash));
         let l2_block_number = game.l2BlockNumber().call().await?;
@@ -120,14 +160,14 @@ where
                 l2_block_number.to::<u64>() - self.config.proposal_interval_in_blocks,
                 l2_block_number.to::<u64>(),
                 Some(l1_head_hash.into()),
-                Some(self.config.safe_db_fallback),
+                self.config.safe_db_fallback,
             )
             .await
             .context("Failed to get host CLI args")?;
 
-        let mem_kv_store = self.host.run(&host_args).await?;
+        let witness_data = self.host.run(&host_args).await?;
 
-        let sp1_stdin = match get_proof_stdin(mem_kv_store) {
+        let sp1_stdin = match self.host.witness_generator().get_sp1_stdin(witness_data) {
             Ok(stdin) => stdin,
             Err(e) => {
                 tracing::error!("Failed to get proof stdin: {}", e);
@@ -217,7 +257,12 @@ where
                 .await?
         };
 
-        let receipt = game.prove(agg_proof.bytes().into()).send().await?.get_receipt().await?;
+        let transaction_request = game.prove(agg_proof.bytes().into()).into_transaction_request();
+
+        let receipt = self
+            .signer
+            .send_transaction_request(self.config.l1_rpc.clone(), transaction_request)
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -239,7 +284,7 @@ where
 
         let extra_data = <(U256, u32)>::abi_encode_packed(&(l2_block_number, parent_game_index));
 
-        let receipt = self
+        let transaction_request = self
             .factory
             .create(
                 self.config.game_type,
@@ -247,16 +292,22 @@ where
                 extra_data.into(),
             )
             .value(self.init_bond)
-            .send()
-            .await
-            .context("Failed to send create transaction")?
-            .with_required_confirmations(NUM_CONFIRMATIONS)
-            .with_timeout(Some(Duration::from_secs(TIMEOUT_SECONDS)))
-            .get_receipt()
+            .into_transaction_request();
+
+        let receipt = self
+            .signer
+            .send_transaction_request(self.config.l1_rpc.clone(), transaction_request)
             .await?;
 
-        let game_address =
-            Address::from_slice(&receipt.inner.logs()[0].inner.data.topics()[1][12..]);
+        let game_address = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                DisputeGameCreated::decode_log(&log.inner).ok().map(|event| event.disputeProxy)
+            })
+            .context("Could not find DisputeGameCreated event in transaction receipt logs")?;
+
         tracing::info!(
             "\x1b[1mNew game at address {:?} created with tx {:?}\x1b[0m",
             game_address,
@@ -264,14 +315,12 @@ where
         );
 
         if self.config.fast_finality_mode {
-            tracing::info!("Fast finality mode enabled: Generating proof for the game immediately");
+            tracing::info!("Fast finality mode enabled: Spawning proof generation task");
 
-            let tx_hash = self.prove_game(game_address).await?;
-            tracing::info!(
-                "\x1b[1mNew game at address {:?} proved with tx {:?}\x1b[0m",
-                game_address,
-                tx_hash
-            );
+            // Spawn a tracked proving task for the new game
+            if let Err(e) = self.spawn_game_proving_task(game_address).await {
+                tracing::warn!("Failed to spawn fast finality proof task: {:?}", e);
+            }
         }
 
         Ok(game_address)
@@ -279,9 +328,8 @@ where
 
     /// Handles the creation of a new game if conditions are met.
     /// Returns the address of the created game, if one was created.
+    #[tracing::instrument(name = "[[Proposing]]", skip(self))]
     pub async fn handle_game_creation(&self) -> Result<Option<Address>> {
-        let _span = tracing::info_span!("[[Proposing]]").entered();
-
         // Get the latest valid proposal.
         let latest_valid_proposal =
             self.factory.get_latest_valid_proposal(self.l2_provider.clone()).await?;
@@ -342,49 +390,9 @@ where
         }
     }
 
-    /// Handles the resolution of all eligible unchallenged games.
-    pub async fn handle_game_resolution(&self) -> Result<()> {
-        let _span = tracing::info_span!("[[Resolving]]").entered();
-
-        self.factory
-            .resolve_games(
-                Mode::Proposer,
-                self.config.max_games_to_check_for_resolution,
-                self.l1_provider_with_wallet.clone(),
-                self.l2_provider.clone(),
-            )
-            .await
-    }
-
-    /// Handles the defense of all eligible games by providing proofs.
-    pub async fn handle_game_defense(&self) -> Result<()> {
-        let _span = tracing::info_span!("[[Defending]]").entered();
-
-        if let Some(game_address) = self
-            .factory
-            .get_oldest_defensible_game_address(
-                self.config.max_games_to_check_for_defense,
-                self.l2_provider.clone(),
-            )
-            .await?
-        {
-            tracing::info!("Attempting to defend game {:?}", game_address);
-
-            let tx_hash = self.prove_game(game_address).await?;
-            tracing::info!(
-                "\x1b[1mSuccessfully defended game {:?} with tx {:?}\x1b[0m",
-                game_address,
-                tx_hash
-            );
-        }
-
-        Ok(())
-    }
-
     /// Handles claiming bonds from resolved games.
-    pub async fn handle_bond_claiming(&self) -> Result<Action> {
-        let _span = tracing::info_span!("[[Claiming Bonds]]").entered();
-
+    #[tracing::instrument(name = "[[Claiming Bonds]]", skip(self))]
+    async fn handle_bond_claiming(&self) -> Result<Action> {
         if let Some(game_address) = self
             .factory
             .get_oldest_claimable_bond_game_address(
@@ -397,21 +405,19 @@ where
             tracing::info!("Attempting to claim bond from game {:?}", game_address);
 
             // Create a contract instance for the game
-            let game =
-                OPSuccinctFaultDisputeGame::new(game_address, self.l1_provider_with_wallet.clone());
+            let game = OPSuccinctFaultDisputeGame::new(game_address, self.l1_provider.clone());
 
             // Create a transaction to claim credit
-            let tx = game.claimCredit(self.prover_address);
+            let transaction_request =
+                game.claimCredit(self.prover_address).into_transaction_request();
 
-            // Send the transaction
-            match tx.send().await {
-                Ok(pending_tx) => {
-                    let receipt = pending_tx
-                        .with_required_confirmations(NUM_CONFIRMATIONS)
-                        .with_timeout(Some(Duration::from_secs(TIMEOUT_SECONDS)))
-                        .get_receipt()
-                        .await?;
-
+            // Sign and send the transaction
+            match self
+                .signer
+                .send_transaction_request(self.config.l1_rpc.clone(), transaction_request)
+                .await
+            {
+                Ok(receipt) => {
                     tracing::info!(
                         "\x1b[1mSuccessfully claimed bond from game {:?} with tx {:?}\x1b[0m",
                         game_address,
@@ -440,7 +446,7 @@ where
             match self.factory.get_latest_valid_proposal(self.l2_provider.clone()).await? {
                 Some((l2_block_number, _game_index)) => l2_block_number,
                 None => {
-                    tracing::debug!("No valid proposals found for metrics");
+                    tracing::info!("No valid proposals found for metrics");
                     self.factory.get_anchor_l2_block_number(self.config.game_type).await?
                 }
             };
@@ -466,53 +472,431 @@ where
     }
 
     /// Runs the proposer indefinitely.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         tracing::info!("OP Succinct Proposer running...");
         let mut interval = time::interval(Duration::from_secs(self.config.fetch_interval));
-        let mut metrics_interval = time::interval(Duration::from_secs(15));
+
+        // Spawn a dedicated task for continuous metrics collection
+        self.spawn_metrics_collector();
 
         loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    match self.handle_game_creation().await {
-                        Ok(Some(_)) => {
-                            ProposerGauge::GamesCreated.increment(1.0);
-                        }
-                        Ok(None) => {}
-                            Err(e) => {
-                            tracing::warn!("Failed to handle game creation: {:?}", e);
-                            ProposerGauge::GameCreationError.increment(1.0);
-                        }
-                    }
+            interval.tick().await;
 
-                    if let Err(e) = self.handle_game_defense().await {
-                        tracing::warn!("Failed to handle game defense: {:?}", e);
-                        ProposerGauge::GameDefenseError.increment(1.0);
-                    }
+            // 1. Handle completed tasks
+            if let Err(e) = self.handle_completed_tasks().await {
+                tracing::warn!("Failed to handle completed tasks: {:?}", e);
+            }
 
-                    if let Err(e) = self.handle_game_resolution().await {
-                        tracing::warn!("Failed to handle game resolution: {:?}", e);
-                        ProposerGauge::GameResolutionError.increment(1.0);
-                    }
+            // 2. Spawn new work (non-blocking)
+            if let Err(e) = self.spawn_pending_operations().await {
+                tracing::warn!("Failed to spawn pending operations: {:?}", e);
+            }
 
-                    match self.handle_bond_claiming().await {
-                        Ok(Action::Performed) => {
-                            ProposerGauge::GamesBondsClaimed.increment(1.0);
-                        }
-                        Ok(Action::Skipped) => {}
-                        Err(e) => {
-                            tracing::warn!("Failed to handle bond claiming: {:?}", e);
-                            ProposerGauge::BondClaimingError.increment(1.0);
-                        }
-                    }
+            // 3. Log task statistics
+            self.log_task_stats().await;
+        }
+    }
+
+    /// Spawn a dedicated metrics collection task
+    fn spawn_metrics_collector(&self) {
+        let proposer_metrics = self.clone();
+        tokio::spawn(async move {
+            let mut metrics_timer = time::interval(Duration::from_secs(15));
+            loop {
+                metrics_timer.tick().await;
+                if let Err(e) = proposer_metrics.fetch_proposer_metrics().await {
+                    tracing::warn!("Failed to fetch metrics: {:?}", e);
+                    ProposerGauge::MetricsError.increment(1.0);
                 }
-                _ = metrics_interval.tick() => {
-                    if let Err(e) = self.fetch_proposer_metrics().await {
-                        tracing::warn!("Failed to fetch metrics: {:?}", e);
-                        ProposerGauge::MetricsError.increment(1.0);
+            }
+        });
+    }
+
+    /// Handle completed tasks and clean them up
+    async fn handle_completed_tasks(&self) -> Result<()> {
+        let mut tasks = self.tasks.lock().await;
+        let mut completed = Vec::new();
+
+        // Find completed tasks
+        for (id, (handle, _)) in tasks.iter() {
+            if handle.is_finished() {
+                completed.push(*id);
+            }
+        }
+
+        // Process completed tasks
+        for id in completed {
+            if let Some((handle, info)) = tasks.remove(&id) {
+                match handle.await {
+                    Ok(Ok(())) => {
+                        tracing::info!("Task {:?} completed successfully", info);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Task {:?} failed: {:?}", info, e);
+                        // Handle task failure based on type
+                        self.handle_task_failure(&info, e).await?;
+                    }
+                    Err(panic) => {
+                        tracing::error!("Task {:?} panicked: {:?}", info, panic);
                     }
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Handle task failure based on task type
+    async fn handle_task_failure(&self, info: &TaskInfo, _error: anyhow::Error) -> Result<()> {
+        match info {
+            TaskInfo::GameCreation { .. } => {
+                ProposerGauge::GameCreationError.increment(1.0);
+            }
+            TaskInfo::GameProving { .. } => {
+                ProposerGauge::GameProvingError.increment(1.0);
+            }
+            TaskInfo::GameResolution => {
+                ProposerGauge::GameResolutionError.increment(1.0);
+            }
+            TaskInfo::BondClaim => {
+                ProposerGauge::BondClaimingError.increment(1.0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn pending operations if not already running
+    async fn spawn_pending_operations(&self) -> Result<()> {
+        // Check if we should create a game and spawn task if needed
+        if !self.has_active_task_of_type(&TaskInfo::GameCreation { block_number: U256::ZERO }).await
+        {
+            match self.spawn_game_creation_task().await {
+                Ok(true) => tracing::info!("Successfully spawned game creation task"),
+                Ok(false) => {
+                    tracing::debug!("No game creation needed - proposal interval not elapsed")
+                }
+                Err(e) => tracing::warn!("Failed to spawn game creation task: {:?}", e),
+            }
+        } else {
+            tracing::info!("Game creation task already active");
+        }
+
+        // Check if we should defend games
+        match self.spawn_game_defense_tasks().await {
+            Ok(true) => tracing::info!("Successfully spawned game defense task"),
+            Ok(false) => tracing::debug!("No games need defense or task already active"),
+            Err(e) => tracing::warn!("Failed to spawn game defense tasks: {:?}", e),
+        }
+
+        // Check if we should resolve games
+        if !self.has_active_task_of_type(&TaskInfo::GameResolution).await {
+            match self.spawn_game_resolution_task().await {
+                Ok(true) => tracing::info!("Successfully spawned game resolution task"),
+                Ok(false) => tracing::debug!("No games need resolution"),
+                Err(e) => tracing::warn!("Failed to spawn game resolution task: {:?}", e),
+            }
+        } else {
+            tracing::info!("Game resolution task already active");
+        }
+
+        // Check if we should claim bonds
+        if !self.has_active_task_of_type(&TaskInfo::BondClaim).await {
+            match self.spawn_bond_claim_task().await {
+                Ok(true) => tracing::info!("Successfully spawned bond claim task"),
+                Ok(false) => tracing::debug!("No bonds available to claim"),
+                Err(e) => tracing::warn!("Failed to spawn bond claim task: {:?}", e),
+            }
+        } else {
+            tracing::info!("Bond claim task already active");
+        }
+
+        Ok(())
+    }
+
+    /// Check if there's an active task of the given type
+    async fn has_active_task_of_type(&self, task_type: &TaskInfo) -> bool {
+        let tasks = self.tasks.lock().await;
+        tasks
+            .values()
+            .any(|(_, info)| std::mem::discriminant(info) == std::mem::discriminant(task_type))
+    }
+
+    /// Log current task statistics
+    async fn log_task_stats(&self) {
+        let tasks = self.tasks.lock().await;
+        let active_count = tasks.len();
+        if active_count > 0 {
+            let mut task_counts: HashMap<&str, usize> = HashMap::new();
+
+            for (_, (_, info)) in tasks.iter() {
+                let task_type = match info {
+                    TaskInfo::GameCreation { .. } => "GameCreation",
+                    TaskInfo::GameProving { .. } => "GameProving",
+                    TaskInfo::GameResolution => "GameResolution",
+                    TaskInfo::BondClaim => "BondClaim",
+                };
+                *task_counts.entry(task_type).or_insert(0) += 1;
+            }
+
+            let task_types: Vec<String> = task_counts
+                .into_iter()
+                .map(|(type_name, count)| format!("{type_name}: {count}"))
+                .collect();
+
+            tracing::info!("Active tasks: {} ({})", active_count, task_types.join(", "));
+        }
+    }
+
+    /// Spawn a game creation task if conditions are met
+    ///
+    /// Returns:
+    /// - Ok(true): Task was successfully spawned
+    /// - Ok(false): No work needed (proposal interval not elapsed or no finalized blocks)
+    /// - Err: Actual error occurred during task spawning
+    #[tracing::instrument(name = "[[Proposing]]", skip(self))]
+    async fn spawn_game_creation_task(&self) -> Result<bool> {
+        // First check if we should create a game
+        let should_create = self.should_create_game().await?;
+        if !should_create {
+            return Ok(false); // No work needed - normal case
+        }
+
+        let proposer = self.clone();
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+
+        let handle = tokio::spawn(async move {
+            match proposer.handle_game_creation().await {
+                Ok(Some(_game_address)) => {
+                    ProposerGauge::GamesCreated.increment(1.0);
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            }
+        });
+
+        // Get the next proposal block for task info
+        let next_block = self.get_next_proposal_block().await.unwrap_or(U256::ZERO);
+        let task_info = TaskInfo::GameCreation { block_number: next_block };
+
+        self.tasks.lock().await.insert(task_id, (handle, task_info));
+        tracing::info!("Spawned game creation task {} for block {}", task_id, next_block);
+        Ok(true)
+    }
+
+    /// Check if we should create a game
+    async fn should_create_game(&self) -> Result<bool> {
+        // Use the existing logic from handle_game_creation
+        let latest_valid_proposal =
+            self.factory.get_latest_valid_proposal(self.l2_provider.clone()).await?;
+
+        let (latest_proposed_block_number, next_l2_block_number_for_proposal, _) =
+            match latest_valid_proposal {
+                Some((latest_block, latest_game_idx)) => (
+                    latest_block,
+                    latest_block + U256::from(self.config.proposal_interval_in_blocks),
+                    latest_game_idx.to::<u32>(),
+                ),
+                None => {
+                    let anchor_l2_block_number =
+                        self.factory.get_anchor_l2_block_number(self.config.game_type).await?;
+                    (
+                        anchor_l2_block_number,
+                        anchor_l2_block_number
+                            .checked_add(U256::from(self.config.proposal_interval_in_blocks))
+                            .unwrap(),
+                        u32::MAX,
+                    )
+                }
+            };
+
+        let finalized_l2_head_block_number = self
+            .host
+            .get_finalized_l2_block_number(&self.fetcher, latest_proposed_block_number.to::<u64>())
+            .await?;
+
+        Ok(finalized_l2_head_block_number
+            .map(|finalized_block| U256::from(finalized_block) > next_l2_block_number_for_proposal)
+            .unwrap_or(false))
+    }
+
+    /// Get the next proposal block number
+    async fn get_next_proposal_block(&self) -> Result<U256> {
+        let latest_valid_proposal =
+            self.factory.get_latest_valid_proposal(self.l2_provider.clone()).await?;
+
+        match latest_valid_proposal {
+            Some((latest_block, _)) => {
+                Ok(latest_block + U256::from(self.config.proposal_interval_in_blocks))
+            }
+            None => {
+                let anchor_l2_block_number =
+                    self.factory.get_anchor_l2_block_number(self.config.game_type).await?;
+                Ok(anchor_l2_block_number
+                    .checked_add(U256::from(self.config.proposal_interval_in_blocks))
+                    .unwrap())
+            }
+        }
+    }
+
+    /// Spawn game defense tasks if needed
+    ///
+    /// Returns:
+    /// - Ok(true): Defense task was successfully spawned
+    /// - Ok(false): No work needed (no defensible games or task already exists)
+    /// - Err: Actual error occurred during task spawning
+    #[tracing::instrument(name = "[[Defending]]", skip(self))]
+    async fn spawn_game_defense_tasks(&self) -> Result<bool> {
+        // Check if there are games needing defense
+        if let Some(game_address) = self
+            .factory
+            .get_oldest_defensible_game_address(
+                self.config.max_games_to_check_for_defense,
+                self.l2_provider.clone(),
+            )
+            .await?
+        {
+            // Check if we already have a proving task for this game
+            if !self.has_active_proving_for_game(game_address).await {
+                self.spawn_game_proving_task(game_address).await?;
+                Ok(true)
+            } else {
+                Ok(false) // Task already exists - no new work needed
+            }
+        } else {
+            Ok(false) // No games need defense - normal case
+        }
+    }
+
+    /// Check if there's an active proving task for a specific game
+    async fn has_active_proving_for_game(&self, game_address: Address) -> bool {
+        let tasks = self.tasks.lock().await;
+        tasks.values().any(|(_, info)| {
+            matches!(info, TaskInfo::GameProving { game_address: addr } if *addr == game_address)
+        })
+    }
+
+    /// Spawn a game proving task for a specific game
+    async fn spawn_game_proving_task(&self, game_address: Address) -> Result<()> {
+        let proposer: OPSuccinctProposer<P, H> = self.clone();
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+
+        // Get the game block number to include in logs
+        let game = OPSuccinctFaultDisputeGame::new(game_address, self.l1_provider.clone());
+        let l2_block_number = game.l2BlockNumber().call().await?;
+        let start_block = l2_block_number.to::<u64>() - self.config.proposal_interval_in_blocks;
+        let end_block = l2_block_number.to::<u64>();
+
+        tracing::info!(
+            "Spawning game proving task {} for game {:?} (blocks {}-{})",
+            task_id,
+            game_address,
+            start_block,
+            end_block
+        );
+
+        // In mock mode, use spawn_blocking for CPU-intensive mock proof generation
+        // In network mode, use spawn for async network operations
+        let handle = if proposer.config.mock_mode {
+            tokio::task::spawn_blocking(move || {
+                // Use a runtime for the blocking task to handle async operations
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async move {
+                    let tx_hash = proposer.prove_game(game_address).await?;
+                    tracing::info!(
+                        "\x1b[1mSuccessfully proved game {:?} with tx {:?}\x1b[0m",
+                        game_address,
+                        tx_hash
+                    );
+                    Ok(())
+                })
+            })
+        } else {
+            tokio::spawn(async move {
+                let tx_hash = proposer.prove_game(game_address).await?;
+                tracing::info!(
+                    "\x1b[1mSuccessfully proved game {:?} with tx {:?}\x1b[0m",
+                    game_address,
+                    tx_hash
+                );
+                Ok(())
+            })
+        };
+
+        let task_info = TaskInfo::GameProving { game_address };
+        self.tasks.lock().await.insert(task_id, (handle, task_info));
+        Ok(())
+    }
+
+    /// Spawn a game resolution task if needed
+    ///
+    /// Returns:
+    /// - Ok(true): Resolution task was successfully spawned
+    /// - Ok(false): No work needed (no games to resolve)
+    /// - Err: Actual error occurred during task spawning
+    async fn spawn_game_resolution_task(&self) -> Result<bool> {
+        let proposer = self.clone();
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+
+        let handle = tokio::spawn(async move {
+            proposer
+                .factory
+                .resolve_games(
+                    Mode::Proposer,
+                    proposer.config.max_games_to_check_for_resolution,
+                    proposer.signer.clone(),
+                    proposer.config.l1_rpc.clone(),
+                    proposer.l1_provider.clone(),
+                    proposer.l2_provider.clone(),
+                )
+                .await
+        });
+
+        let task_info = TaskInfo::GameResolution;
+        self.tasks.lock().await.insert(task_id, (handle, task_info));
+        tracing::info!("Spawned game resolution task {}", task_id);
+        Ok(true)
+    }
+
+    /// Spawn a bond claim task if needed
+    ///
+    /// Returns:
+    /// - Ok(true): Bond claim task was successfully spawned
+    /// - Ok(false): No work needed (no claimable bonds available)
+    /// - Err: Actual error occurred during task spawning
+    async fn spawn_bond_claim_task(&self) -> Result<bool> {
+        // First check if there are bonds to claim
+        let has_claimable_bonds = self
+            .factory
+            .get_oldest_claimable_bond_game_address(
+                self.config.game_type,
+                self.config.max_games_to_check_for_bond_claiming,
+                self.prover_address,
+            )
+            .await?
+            .is_some();
+
+        if !has_claimable_bonds {
+            return Ok(false); // No bonds to claim - normal case
+        }
+
+        let proposer = self.clone();
+        let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+
+        let handle = tokio::spawn(async move {
+            match proposer.handle_bond_claiming().await {
+                Ok(Action::Performed) => {
+                    ProposerGauge::GamesBondsClaimed.increment(1.0);
+                    Ok(())
+                }
+                Ok(Action::Skipped) => Ok(()),
+                Err(e) => Err(e),
+            }
+        });
+
+        let task_info = TaskInfo::BondClaim;
+        self.tasks.lock().await.insert(task_id, (handle, task_info));
+        tracing::info!("Spawned bond claim task {}", task_id);
+        Ok(true)
     }
 }

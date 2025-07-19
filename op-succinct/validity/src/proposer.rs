@@ -1,80 +1,70 @@
-use crate::{
-    db::{DriverDBClient, OPSuccinctRequest, RequestMode, RequestStatus},
-    find_gaps, get_latest_proposed_block_number, get_ranges_to_prove, CommitmentConfig,
-    ContractConfig, OPSuccinctProofRequester, ProgramConfig, ProposerSigner, RequesterConfig,
-    ValidityGauge,
-};
-use alloy_consensus::{TxEnvelope, TypedTransaction};
-use alloy_eips::{BlockId, Decodable2718};
-use alloy_network::{EthereumWallet, TransactionBuilder, TransactionBuilder4844};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
+
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_provider::{
-    network::ReceiptResponse, Network, PendingTransactionBuilder, Provider, ProviderBuilder,
-    Web3Signer,
-};
+use alloy_provider::{network::ReceiptResponse, Provider};
 use alloy_sol_types::SolValue;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use op_succinct_client_utils::{boot::hash_rollup_config, types::u32_to_u8};
+use op_succinct_elfs::AGGREGATION_ELF;
 use op_succinct_host_utils::{
-    fetcher::OPSuccinctDataFetcher, get_range_elf_embedded, hosts::OPSuccinctHost,
-    metrics::MetricsGauge,
+    fetcher::OPSuccinctDataFetcher, host::OPSuccinctHost, metrics::MetricsGauge,
     DisputeGameFactory::DisputeGameFactoryInstance as DisputeGameFactoryContract,
     OPSuccinctL2OutputOracle::OPSuccinctL2OutputOracleInstance as OPSuccinctL2OOContract,
-    AGGREGATION_ELF,
 };
-use serde::{Deserialize, Serialize};
+use op_succinct_proof_utils::get_range_elf_embedded;
+use op_succinct_signer_utils::Signer;
 use sp1_sdk::{
-    network::proto::network::{ExecutionStatus, FulfillmentStatus},
-    HashableKey, NetworkProver, Prover, ProverClient, SP1Proof, SP1ProofWithPublicValues,
+    network::{proto::types::{ExecutionStatus, FulfillmentStatus}, prover::NetworkProver},
+    client::ProverClient,
+    prover::Prover,
+    proof::{SP1Proof, SP1ProofWithPublicValues},
+    CpuProver, HashableKey, SP1ProvingKey, SP1VerifyingKey,
 };
-use std::{collections::HashMap, env, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
-use url::Url;
+
+use crate::{
+    db::{DriverDBClient, OPSuccinctRequest, RequestMode, RequestStatus},
+    find_gaps, get_latest_proposed_block_number, get_ranges_to_prove, CommitmentConfig,
+    ContractConfig, OPSuccinctProofRequester, ProgramConfig, RequesterConfig, ValidityGauge,
+};
 
 /// Configuration for the driver.
 pub struct DriverConfig {
-    pub network_prover: Arc<NetworkProver>,
+    pub network_prover: Option<Arc<NetworkProver>>,
+    pub local_prover: Option<Arc<CpuProver>>,
     pub fetcher: Arc<OPSuccinctDataFetcher>,
     pub driver_db_client: Arc<DriverDBClient>,
-    pub proposer_signer: ProposerSigner,
+    pub signer: Signer,
     pub loop_interval: u64,
 }
 /// Type alias for a map of task IDs to their join handles and associated requests
 pub type TaskMap = HashMap<i64, (tokio::task::JoinHandle<Result<()>>, OPSuccinctRequest)>;
 
-pub struct Proposer<P, N, H: OPSuccinctHost>
+pub struct Proposer<P, H: OPSuccinctHost>
 where
-    P: Provider<N> + 'static,
-    N: Network<UnsignedTx = TypedTransaction, TxEnvelope = TxEnvelope>,
-    N::TransactionRequest: TransactionBuilder4844,
+    P: Provider + 'static,
 {
     driver_config: DriverConfig,
-    contract_config: ContractConfig<P, N>,
+    contract_config: ContractConfig<P>,
     program_config: ProgramConfig,
     requester_config: RequesterConfig,
     proof_requester: Arc<OPSuccinctProofRequester<H>>,
     tasks: Arc<Mutex<TaskMap>>,
 }
 
-/// 5 L1 confirmations (1 minute)
-const NUM_CONFIRMATIONS: u64 = 5;
-/// 2 minute timeout.
-const TIMEOUT: u64 = 120;
-
-impl<P, N, H: OPSuccinctHost> Proposer<P, N, H>
+impl<P, H: OPSuccinctHost> Proposer<P, H>
 where
-    P: Provider<N> + 'static + Clone,
-    N: Network<UnsignedTx = TypedTransaction, TxEnvelope = TxEnvelope>,
-    N::TransactionRequest: TransactionBuilder4844,
+    P: Provider + 'static + Clone,
 {
     pub async fn new(
         provider: P,
         db_client: Arc<DriverDBClient>,
         fetcher: Arc<OPSuccinctDataFetcher>,
         requester_config: RequesterConfig,
-        proposer_signer: ProposerSigner,
+        signer: Signer,
         loop_interval: u64,
         host: Arc<H>,
     ) -> Result<Self> {
@@ -98,20 +88,35 @@ where
             .add_chain_lock(requester_config.l1_chain_id, requester_config.l2_chain_id)
             .await?;
 
-        // Set a default network private key to avoid an error in mock mode.
-        let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
-            tracing::warn!(
-                "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
-            );
-            "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
-        });
+        let (network_prover, local_prover) = if requester_config.use_local_proving {
+            (None, Some(Arc::new(CpuProver::new())))
+        } else {
+            // Set a default network private key to avoid an error in mock mode.
+            let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
+                );
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            });
 
-        let network_prover =
-            Arc::new(ProverClient::builder().network().private_key(&private_key).build());
+            (Some(Arc::new(ProverClient::builder().network().private_key(&private_key).build())), None)
+        };
 
-        let (range_pk, range_vk) = network_prover.setup(get_range_elf_embedded());
+        let (range_pk, range_vk): (SP1ProvingKey, SP1VerifyingKey) = if let Some(ref network_prover) = network_prover {
+            network_prover.setup(get_range_elf_embedded())
+        } else if let Some(ref local_prover) = local_prover {
+            local_prover.setup(get_range_elf_embedded())
+        } else {
+            unreachable!("Either network or local prover must be set")
+        };
 
-        let (agg_pk, agg_vk) = network_prover.setup(AGGREGATION_ELF);
+        let (agg_pk, agg_vk): (SP1ProvingKey, SP1VerifyingKey) = if let Some(ref network_prover) = network_prover {
+            network_prover.setup(AGGREGATION_ELF)
+        } else if let Some(ref local_prover) = local_prover {
+            local_prover.setup(AGGREGATION_ELF)
+        } else {
+            unreachable!("Either network or local prover must be set")
+        };
         let multi_block_vkey_u8 = u32_to_u8(range_vk.vk.hash_u32());
         let range_vkey_commitment = B256::from(multi_block_vkey_u8);
         let agg_vkey_hash = B256::from_str(&agg_vk.bytes32()).unwrap();
@@ -135,6 +140,7 @@ where
         let proof_requester = Arc::new(OPSuccinctProofRequester::new(
             host,
             network_prover.clone(),
+            local_prover.clone(),
             fetcher.clone(),
             db_client.clone(),
             program_config.clone(),
@@ -143,6 +149,7 @@ where
             requester_config.agg_proof_strategy,
             requester_config.agg_proof_mode,
             requester_config.safe_db_fallback,
+            requester_config.use_local_proving,
         ));
 
         let l2oo_contract =
@@ -154,9 +161,10 @@ where
         let proposer = Proposer {
             driver_config: DriverConfig {
                 network_prover,
+                local_prover,
                 fetcher,
                 driver_db_client: db_client,
-                proposer_signer,
+                signer,
                 loop_interval,
             },
             contract_config: ContractConfig {
@@ -272,6 +280,11 @@ where
     /// Handle all proof requests in the Prove state.
     #[tracing::instrument(name = "proposer.handle_proving_requests", skip(self))]
     pub async fn handle_proving_requests(&self) -> Result<()> {
+        // For local proving, proofs are completed immediately so this step is skipped
+        if self.requester_config.use_local_proving {
+            return Ok(());
+        }
+
         // Get all requests from the database.
         let prove_requests = self
             .driver_config
@@ -296,9 +309,19 @@ where
     #[tracing::instrument(name = "proposer.process_proof_request_status", skip(self, request))]
     pub async fn process_proof_request_status(&self, request: OPSuccinctRequest) -> Result<()> {
         if let Some(proof_request_id) = request.proof_request_id.as_ref() {
-            let (status, proof) = self
-                .driver_config
-                .network_prover
+            // For local proving, proofs are generated synchronously and should already be complete
+            if self.requester_config.use_local_proving {
+                // Local proofs should be completed immediately after generation
+                // This function should not be called for local proving mode
+                tracing::warn!("process_proof_request_status called for local proving mode request {}", request.id);
+                return Ok(());
+            }
+
+            // Network proving path - check status with network prover
+            let network_prover = self.driver_config.network_prover.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Expected NetworkProver for network proving mode"))?;
+            
+            let (status, proof) = network_prover
                 .get_proof_status(B256::from_slice(proof_request_id))
                 .await?;
 
@@ -476,8 +499,14 @@ where
                     .checkpointBlockHash(U256::from(latest_header.number))
                     .into_transaction_request();
 
-                let receipt =
-                    self.sign_transaction_request(transaction_request).await?.get_receipt().await?;
+                let receipt = self
+                    .driver_config
+                    .signer
+                    .send_transaction_request(
+                        self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
+                        transaction_request,
+                    )
+                    .await?;
 
                 // If transaction reverted, log the error.
                 if !receipt.status() {
@@ -610,7 +639,38 @@ where
             .await?;
 
         if let Some(unreq_agg_request) = unreq_agg_request {
-            return Ok(Some(unreq_agg_request));
+            // Fetch consecutive range proofs from the database associated with the aggregation
+            // proof request.
+            let range_proofs = self
+                .proof_requester
+                .db_client
+                .get_consecutive_complete_range_proofs(
+                    unreq_agg_request.start_block,
+                    unreq_agg_request.end_block,
+                    &self.program_config.commitments,
+                    self.requester_config.l1_chain_id,
+                    self.requester_config.l2_chain_id,
+                )
+                .await?;
+
+            // Validate the aggregation proof request
+            match self.validate_aggregation_request(&range_proofs, &unreq_agg_request).await {
+                true => {
+                    debug!(
+                        "Aggregation request validated successfully: start_block={}, end_block={}",
+                        unreq_agg_request.start_block, unreq_agg_request.end_block
+                    );
+                    return Ok(Some(unreq_agg_request));
+                }
+                false => {
+                    debug!(
+                        "Aggregation request validation failed, moving to range proofs: start_block={}, end_block={}",
+                        unreq_agg_request.start_block, unreq_agg_request.end_block
+                    );
+                    ValidityGauge::AggProofValidationErrorCount.increment(1.0);
+                    // Validation failed, continue to try fetching range proofs
+                }
+            }
         }
 
         let unreq_range_request = self
@@ -629,6 +689,104 @@ where
         }
 
         Ok(None)
+    }
+
+    /// Validates an aggregation proof request by checking that:
+    /// 1. There are no gaps between consecutive range proofs
+    /// 2. There are no duplicate/overlapping range proofs
+    /// 3. The range proofs cover the entire block range
+    pub async fn validate_aggregation_request(
+        &self,
+        range_proofs: &[OPSuccinctRequest],
+        agg_request: &OPSuccinctRequest,
+    ) -> bool {
+        debug!(
+            "Validating aggregation proof request: start_block={}, end_block={}",
+            agg_request.start_block, agg_request.end_block
+        );
+
+        // Log all constituent range proofs
+        for (i, proof) in range_proofs.iter().enumerate() {
+            debug!(
+                "Range proof {}: start_block={}, end_block={}",
+                i, proof.start_block, proof.end_block
+            );
+        }
+
+        // If no range proofs found, validation fails
+        if range_proofs.is_empty() {
+            warn!(
+                start_block = ?agg_request.start_block,
+                end_block = ?agg_request.end_block,
+                commitments = ?self.program_config.commitments,
+                "No consecutive span proof range found for request"
+            );
+            return false;
+        }
+
+        let first_range_proof_request =
+            range_proofs.first().expect("Range proofs should not be empty");
+
+        let last_range_proof_request =
+            range_proofs.last().expect("Range proofs should not be empty");
+
+        if first_range_proof_request.start_block != agg_request.start_block {
+            warn!(
+                expected_start_block = ?agg_request.start_block,
+                actual_start_block = ?first_range_proof_request.start_block,
+                commitments = ?self.program_config.commitments,
+                "Range proofs start block does not match aggregation request"
+            );
+
+            return false;
+        }
+
+        if last_range_proof_request.end_block != agg_request.end_block {
+            warn!(
+                expected_end_block = ?agg_request.end_block,
+                actual_end_block = ?last_range_proof_request.end_block,
+                commitments = ?self.program_config.commitments,
+                "Range proofs end block does not match aggregation request"
+            );
+            return false;
+        }
+
+        // Check for gaps and duplicates / overlaps between consecutive proofs
+        for i in 1..range_proofs.len() {
+            let prev_proof = &range_proofs[i - 1];
+            let curr_proof = &range_proofs[i];
+
+            // Check for gap
+            if prev_proof.end_block != curr_proof.start_block {
+                debug!(
+                    "Gap detected: proof {} ends at {} but proof {} starts at {}",
+                    i - 1,
+                    prev_proof.end_block,
+                    i,
+                    curr_proof.start_block
+                );
+                return false;
+            }
+
+            // Check for overlap (duplicate blocks)
+            if prev_proof.end_block > curr_proof.start_block {
+                debug!(
+                    "Overlap detected: proof {} ends at {} but proof {} starts at {}",
+                    i - 1,
+                    prev_proof.end_block,
+                    i,
+                    curr_proof.start_block
+                );
+                return false;
+            }
+        }
+
+        // All validation checks passed
+        debug!(
+            "Aggregation request validated successfully with {} consecutive range proofs",
+            range_proofs.len()
+        );
+        true
     }
 
     /// Relay all completed aggregation proofs to the contract.
@@ -691,119 +849,97 @@ where
         &self,
         completed_agg_proof: &OPSuccinctRequest,
     ) -> Result<B256> {
-        if self.requester_config.skip_l1_submission {
-            // Save the proof locally instead of submitting to L1
-            info!(
-                "Skipping L1 submission and saving proof locally for blocks {}-{}",
-                completed_agg_proof.start_block, completed_agg_proof.end_block
-            );
-            let proof_dir = "data/saved_proofs";
-            fs::create_dir_all(proof_dir).context("Failed to create proof directory")?;
-            let filename = format!(
-                "{}_{}.bin",
-                completed_agg_proof.start_block, completed_agg_proof.end_block
-            );
-            let file_path = Path::new(proof_dir).join(filename);
+        // Get the output at the end block of the last completed aggregation proof.
+        let output = self
+            .driver_config
+            .fetcher
+            .get_l2_output_at_block(completed_agg_proof.end_block as u64)
+            .await?;
 
-            // Serialize and save the proof
-            let proof_bytes = completed_agg_proof
-                .proof
-                .clone()
-                .ok_or_else(|| anyhow!("Proof is missing in completed_agg_proof"))?;
-            fs::write(&file_path, proof_bytes)
-                .context(format!("Failed to write proof to file: {:?}", file_path))?;
-            info!("Proof saved to {:?}", file_path);
+        // If the DisputeGameFactory address is set, use it to create a new validity dispute game
+        // that will resolve with the proof. Note: In the DGF setting, the proof immediately
+        // resolves the game. Otherwise, propose the L2 output.
+        let receipt = if self.contract_config.dgf_address != Address::ZERO {
+            // Validity game type: https://github.com/ethereum-optimism/optimism/blob/develop/packages/contracts-bedrock/src/dispute/lib/Types.sol#L64.
+            const OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE: u32 = 6;
 
-            // Return a dummy transaction hash
-            Ok(B256::ZERO)
-        } else {
-            // Original L1 submission code
-            // Get the output at the end block of the last completed aggregation proof.
-            let output = self
-                .driver_config
-                .fetcher
-                .get_l2_output_at_block(completed_agg_proof.end_block as u64)
+            // Get the initialization bond for the validity dispute game.
+            let init_bond = self
+                .contract_config
+                .dgf_contract
+                .initBonds(OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE)
+                .call()
                 .await?;
 
-            // If the DisputeGameFactory address is set, use it to create a new validity dispute
-            // game that will resolve with the proof. Note: In the DGF setting, the
-            // proof immediately resolves the game. Otherwise, propose the L2 output.
-            let receipt = if self.contract_config.dgf_address != Address::ZERO {
-                // Validity game type: https://github.com/ethereum-optimism/optimism/blob/develop/packages/contracts-bedrock/src/dispute/lib/Types.sol#L64.
-                const OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE: u32 = 6;
+            let extra_data = <(U256, U256, Address, B256, Bytes)>::abi_encode_packed(&(
+                U256::from(completed_agg_proof.end_block as u64),
+                U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap() as u64),
+                self.requester_config.prover_address,
+                self.requester_config.op_succinct_config_name_hash,
+                completed_agg_proof.proof.as_ref().unwrap().clone().into(),
+            ));
 
-                // Get the initialization bond for the validity dispute game.
-                let init_bond = self
-                    .contract_config
-                    .dgf_contract
-                    .initBonds(OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE)
-                    .call()
-                    .await?;
+            let transaction_request = self
+                .contract_config
+                .dgf_contract
+                .create(
+                    OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE,
+                    output.output_root,
+                    extra_data.into(),
+                )
+                .value(init_bond)
+                .into_transaction_request();
 
-                let extra_data = <(U256, U256, Address, Bytes)>::abi_encode_packed(&(
-                    U256::from(completed_agg_proof.end_block as u64),
-                    U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap() as u64),
+            self.driver_config
+                .signer
+                .send_transaction_request(
+                    self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
+                    transaction_request,
+                )
+                .await?
+        } else {
+            // Propose the L2 output.
+            let transaction_request = self
+                .contract_config
+                .l2oo_contract
+                .proposeL2Output(
+                    self.requester_config.op_succinct_config_name_hash,
+                    output.output_root,
+                    U256::from(completed_agg_proof.end_block),
+                    U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap()),
+                    completed_agg_proof.proof.clone().unwrap().into(),
                     self.requester_config.prover_address,
-                    completed_agg_proof.proof.as_ref().unwrap().clone().into(),
-                ));
+                )
+                .into_transaction_request();
 
-                let transaction_request = self
-                    .contract_config
-                    .dgf_contract
-                    .create(
-                        OP_SUCCINCT_VALIDITY_DISPUTE_GAME_TYPE,
-                        output.output_root,
-                        extra_data.into(),
-                    )
-                    .value(init_bond)
-                    .into_transaction_request();
+            self.driver_config
+                .signer
+                .send_transaction_request(
+                    self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
+                    transaction_request,
+                )
+                .await?
+        };
 
-                self.sign_transaction_request(transaction_request)
-                    .await?
-                    .with_required_confirmations(NUM_CONFIRMATIONS)
-                    .with_timeout(Some(Duration::from_secs(TIMEOUT)))
-                    .get_receipt()
-                    .await?
-            } else {
-                // Propose the L2 output.
-                let transaction_request = self
-                    .contract_config
-                    .l2oo_contract
-                    .proposeL2Output(
-                        output.output_root,
-                        U256::from(completed_agg_proof.end_block),
-                        U256::from(completed_agg_proof.checkpointed_l1_block_number.unwrap()),
-                        completed_agg_proof.proof.clone().unwrap().into(),
-                        self.requester_config.prover_address,
-                    )
-                    .into_transaction_request();
-
-                self.sign_transaction_request(transaction_request)
-                    .await?
-                    .with_required_confirmations(NUM_CONFIRMATIONS)
-                    .with_timeout(Some(Duration::from_secs(TIMEOUT)))
-                    .get_receipt()
-                    .await?
-            };
-
-            // If the transaction reverted, log the error.
-            if !receipt.status() {
-                return Err(anyhow!("Transaction reverted: {:?}", receipt));
-            }
-
-            Ok(receipt.transaction_hash())
+        // If the transaction reverted, log the error.
+        if !receipt.status() {
+            return Err(anyhow!("Transaction reverted: {:?}", receipt));
         }
+
+        Ok(receipt.transaction_hash())
     }
 
     /// Validate the requester config matches the contract.
     async fn validate_contract_config(&self) -> Result<()> {
-        // Validate the requester config matches the contract.
-        let contract_rollup_config_hash =
-            self.contract_config.l2oo_contract.rollupConfigHash().call().await?;
-        let contract_agg_vkey_hash =
-            self.contract_config.l2oo_contract.aggregationVkey().call().await?;
-        let contract_range_vkey_commitment =
-            self.contract_config.l2oo_contract.rangeVkeyCommitment().call().await?;
+        let config_name = self.requester_config.op_succinct_config_name_hash;
+
+        let contract_config =
+            self.contract_config.l2oo_contract.opSuccinctConfigs(config_name).call().await?;
+
+        // Extract the OpSuccinctConfig fields with meaningful names.
+        let contract_agg_vkey_hash = contract_config.aggregation_vkey();
+        let contract_range_vkey_commitment = contract_config.range_vkey_commitment();
+        let contract_rollup_config_hash = contract_config.rollup_config_hash();
 
         let rollup_config_hash_match =
             contract_rollup_config_hash == self.program_config.commitments.rollup_config_hash;
@@ -1218,144 +1354,5 @@ where
         }
 
         Ok(Some(current_end))
-    }
-
-    /// Sign a transaction request.
-    async fn sign_transaction_request(
-        &self,
-        transaction_request: N::TransactionRequest,
-    ) -> Result<PendingTransactionBuilder<N>> {
-        sign_transaction_request_inner(
-            self.driver_config.proposer_signer.clone(),
-            self.driver_config.fetcher.as_ref().rpc_config.l1_rpc.clone(),
-            transaction_request,
-        )
-        .await
-    }
-}
-
-/// Sign a transaction request using the configured `proposer_signer`.
-async fn sign_transaction_request_inner<N>(
-    proposer_signer: ProposerSigner,
-    l1_rpc: Url,
-    mut transaction_request: N::TransactionRequest,
-) -> Result<PendingTransactionBuilder<N>>
-where
-    N: Network<UnsignedTx = TypedTransaction, TxEnvelope = TxEnvelope>,
-    N::TransactionRequest: TransactionBuilder4844,
-{
-    match proposer_signer {
-        ProposerSigner::Web3Signer(signer_url, signer_address) => {
-            // Set the from address to the signer address.
-            transaction_request.set_from(signer_address);
-
-            // Fill the transaction request with all of the relevant gas and nonce information.
-            let provider = ProviderBuilder::new().network::<N>().connect_http(l1_rpc);
-            let filled_tx = provider.fill(transaction_request).await?;
-
-            // Sign the transaction request using the Web3Signer.
-            let web3_provider = ProviderBuilder::new().network::<N>().connect_http(signer_url);
-            let signer = Web3Signer::new(web3_provider.clone(), signer_address);
-
-            let tx = filled_tx.as_builder().unwrap().clone();
-
-            // NOTE: This is a hack because there is not a "data" field on the TransactionRequest.
-            // `eth_signTransaction` expects a "data" field with the calldata.
-            // TODO: Once alloy fixes this, we can remove this wrapper.
-            let wrapper = TransactionRequestWrapper::<N>::new(tx);
-
-            let raw: Bytes =
-                signer.provider().client().request("eth_signTransaction", (wrapper,)).await?;
-
-            let tx_envelope = N::TxEnvelope::decode_2718(&mut raw.as_ref()).unwrap();
-
-            Ok(provider.send_tx_envelope(tx_envelope).await?)
-        }
-        ProposerSigner::LocalSigner(private_key) => {
-            let provider = ProviderBuilder::new()
-                .network::<N>()
-                .wallet(EthereumWallet::new(private_key.clone()))
-                .connect_http(l1_rpc);
-
-            // Set the from address to the Ethereum wallet address.
-            transaction_request.set_from(private_key.address());
-
-            // Fill the transaction request with all of the relevant gas and nonce information.
-            let filled_tx = provider.fill(transaction_request).await?;
-
-            Ok(provider.send_tx_envelope(filled_tx.as_envelope().unwrap().clone()).await?)
-        }
-    }
-}
-
-/// A wrapper around `TransactionRequest` that adds a data field as bytes.
-///
-/// This is needed because:
-/// 1. The `TransactionRequest` trait and `TransactionBuilder` trait don't include methods to set
-///    the "data" field directly (only `input()` and `set_input()` are available).
-/// 2. Web3Signer's `eth_signTransaction` method specifically expects a "data" field in the JSON-RPC
-///    request, not the "input" field.
-/// 3. While the alloy-rpc-types-eth crate has methods like `normalize_data()` and `set_both()` to
-///    work with both fields, these are only implemented on the specific Ethereum transaction type
-///    struct and aren't accessible through the generic `N::TransactionRequest` interface we're
-///    using here.
-///
-/// TODO(fakedev9999): Once alloy fixes this, we can remove this wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransactionRequestWrapper<N: Network> {
-    /// The underlying transaction request
-    #[serde(flatten)]
-    pub tx: N::TransactionRequest,
-    /// The transaction data as bytes
-    pub data: Option<Bytes>,
-}
-
-impl<N: Network> TransactionRequestWrapper<N> {
-    /// Create a new wrapper around a transaction request
-    pub fn new(tx: N::TransactionRequest) -> Self {
-        let data = tx.input().cloned();
-        Self { tx, data }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy_network::Ethereum;
-    use alloy_primitives::address;
-
-    use super::*;
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_sign_transaction_request() {
-        let proposer_signer = ProposerSigner::Web3Signer(
-            "http://localhost:9000".parse().unwrap(),
-            "0x9b3F173823E944d183D532ed236Ee3B83Ef15E1d".parse().unwrap(),
-        );
-
-        let provider = ProviderBuilder::new()
-            .network::<Ethereum>()
-            .connect_http("http://localhost:8545".parse().unwrap());
-
-        let l2oo_contract = OPSuccinctL2OOContract::new(
-            address!("0xDafA1019F21AB8B27b319B1085f93673F02A69B7"),
-            provider.clone(),
-        );
-
-        let latest_header = provider.get_block(BlockId::latest()).await.unwrap().unwrap();
-
-        let transaction_request = l2oo_contract
-            .checkpointBlockHash(U256::from(latest_header.header.number))
-            .into_transaction_request();
-
-        let signed_tx = sign_transaction_request_inner::<Ethereum>(
-            proposer_signer,
-            "http://localhost:8545".parse().unwrap(),
-            transaction_request,
-        )
-        .await
-        .unwrap();
-
-        println!("Signed transaction receipt: {:?}", signed_tx.get_receipt().await.unwrap());
     }
 }

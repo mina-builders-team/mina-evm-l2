@@ -2,12 +2,12 @@ use alloy_provider::{Provider, ProviderBuilder};
 use anyhow::Result;
 use op_succinct_host_utils::{
     fetcher::OPSuccinctDataFetcher,
-    hosts::initialize_host,
     metrics::{init_metrics, MetricsGauge},
+    setup_logger,
 };
+use op_succinct_proof_utils::initialize_host;
 use op_succinct_validity::{
-    read_proposer_env, setup_proposer_logger, DriverDBClient, Proposer, RequesterConfig,
-    ValidityGauge,
+    read_proposer_env, DriverDBClient, Proposer, RequesterConfig, ValidityGauge,
 };
 use std::sync::Arc;
 use tikv_jemallocator::Jemalloc;
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     dotenv::from_filename(args.env_file).ok();
 
-    setup_proposer_logger();
+    setup_logger();
 
     let fetcher = OPSuccinctDataFetcher::new_with_rollup_config().await?;
 
@@ -45,6 +45,10 @@ async fn main() -> Result<()> {
     let env_config = read_proposer_env()?;
 
     let db_client = Arc::new(DriverDBClient::new(&env_config.db_url).await?);
+
+    let op_succinct_config_name_hash =
+        alloy_primitives::keccak256(env_config.op_succinct_config_name.as_bytes());
+
     let proposer_config = RequesterConfig {
         l1_chain_id: fetcher.l1_provider.get_chain_id().await? as i64,
         l2_chain_id: fetcher.l2_provider.get_chain_id().await? as i64,
@@ -60,7 +64,8 @@ async fn main() -> Result<()> {
         mock: env_config.mock,
         prover_address: env_config.prover_address,
         safe_db_fallback: env_config.safe_db_fallback,
-        skip_l1_submission: true,
+        op_succinct_config_name_hash,
+        use_local_proving: env_config.use_local_proving,
     };
 
     let l1_provider = ProviderBuilder::new().connect_http(env_config.l1_rpc.clone());
@@ -72,7 +77,7 @@ async fn main() -> Result<()> {
         db_client.clone(),
         fetcher.into(),
         proposer_config,
-        env_config.proposer_signer,
+        env_config.signer,
         env_config.loop_interval,
         host,
     )

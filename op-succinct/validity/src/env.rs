@@ -1,20 +1,17 @@
 use std::env;
 
 use alloy_primitives::Address;
-use alloy_signer_local::PrivateKeySigner;
 use anyhow::Result;
+use op_succinct_signer_utils::Signer;
 use reqwest::Url;
 use sp1_sdk::{network::FulfillmentStrategy, SP1ProofMode};
-use std::str::FromStr;
-
-use crate::ProposerSigner;
 
 #[derive(Debug, Clone)]
 pub struct EnvironmentConfig {
     pub db_url: String,
     pub metrics_port: u16,
     pub l1_rpc: Url,
-    pub proposer_signer: ProposerSigner,
+    pub signer: Signer,
     pub prover_address: Address,
     pub loop_interval: u64,
     pub range_proof_strategy: FulfillmentStrategy,
@@ -28,6 +25,8 @@ pub struct EnvironmentConfig {
     pub submission_interval: u64,
     pub mock: bool,
     pub safe_db_fallback: bool,
+    pub op_succinct_config_name: String,
+    pub use_local_proving: bool,
 }
 
 /// Helper function to get environment variables with a default value and parse them.
@@ -54,25 +53,12 @@ const DEFAULT_LOOP_INTERVAL: u64 = 60;
 ///
 /// Signer address and signer URL take precedence over private key.
 pub fn read_proposer_env() -> Result<EnvironmentConfig> {
-    let proposer_signer = if let (Some(signer_url), Some(signer_address)) =
-        (env::var("SIGNER_URL").ok(), env::var("SIGNER_ADDRESS").ok())
-    {
-        let signer_url = Url::parse(&signer_url).expect("Failed to parse SIGNER_URL");
-        let signer_address =
-            Address::from_str(&signer_address).expect("Failed to parse SIGNER_ADDRESS");
-        ProposerSigner::Web3Signer(signer_url, signer_address)
-    } else if let Ok(private_key) = env::var("PRIVATE_KEY") {
-        let private_key =
-            PrivateKeySigner::from_str(&private_key).expect("Failed to parse PRIVATE_KEY");
-        ProposerSigner::LocalSigner(private_key)
-    } else {
-        anyhow::bail!("Neither PRIVATE_KEY nor Web3Signer is set");
-    };
+    let signer = Signer::from_env()?;
 
     // The prover address takes precedence over the signer address. Note: Setting the prover address
     // in the context of the OP Succinct proposer typically does not make sense, as the contract
     // will verify `tx.origin` matches the `proverAddress`.
-    let prover_address = get_env_var("PROVER_ADDRESS", Some(proposer_signer.address()))?;
+    let prover_address = get_env_var("PROVER_ADDRESS", Some(signer.address()))?;
 
     // Parse strategy values
     let range_proof_strategy = if get_env_var("RANGE_PROOF_STRATEGY", Some("reserved".to_string()))?
@@ -107,7 +93,7 @@ pub fn read_proposer_env() -> Result<EnvironmentConfig> {
     let config = EnvironmentConfig {
         metrics_port: get_env_var("METRICS_PORT", Some(8080))?,
         l1_rpc: get_env_var("L1_RPC", None)?,
-        proposer_signer,
+        signer,
         prover_address,
         db_url: get_env_var("DATABASE_URL", None)?,
         range_proof_strategy,
@@ -122,6 +108,11 @@ pub fn read_proposer_env() -> Result<EnvironmentConfig> {
         mock: get_env_var("OP_SUCCINCT_MOCK", Some(false))?,
         loop_interval,
         safe_db_fallback: get_env_var("SAFE_DB_FALLBACK", Some(false))?,
+        op_succinct_config_name: get_env_var(
+            "OP_SUCCINCT_CONFIG_NAME",
+            Some("opsuccinct_genesis".to_string()),
+        )?,
+        use_local_proving: get_env_var("USE_LOCAL_PROVING", Some(false))?,
     };
 
     Ok(config)

@@ -1,6 +1,6 @@
 [package]
 name = "op-succinct-validity"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -16,11 +16,23 @@ path = "bin/validity.rs"
 # workspace
 tokio.workspace = true
 alloy-primitives.workspace = true
-tracing-subscriber.workspace = true
+
+# tracing and telemetry
 tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-stdout.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
 
 # local
+op-succinct-client-utils.workspace = true
+op-succinct-elfs.workspace = true
 op-succinct-host-utils.workspace = true
+op-succinct-proof-utils.workspace = true
+op-succinct-signer-utils.workspace = true
 
 # sp1
 sp1-sdk.workspace = true
@@ -30,13 +42,9 @@ alloy-eips.workspace = true
 alloy-provider = { workspace = true }
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
-alloy-consensus = { workspace = true }
-alloy-network = { workspace = true }
-alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 
 anyhow.workspace = true
 dotenv.workspace = true
-op-succinct-client-utils.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
@@ -57,7 +65,6 @@ futures-util = "0.3.31"
 clap.workspace = true
 tikv-jemallocator = "0.6.0"
 rustls = "0.23.23"
-url = "2.5.4"
 strum = { workspace = true, features = ["derive"] }
 strum_macros.workspace = true
 
@@ -65,7 +72,6 @@ strum_macros.workspace = true
 op-succinct-build-utils.workspace = true
 
 [features]
-# Building without --features will use `SingleChainOPSuccinctHost` with Ethereum DA.
-default = []
-# Feature flag for Celestia DA support.
-celestia = ["op-succinct-host-utils/celestia"]
+default = ["ethereum"]
+celestia = ["op-succinct-proof-utils/celestia"]
+ethereum = ["op-succinct-proof-utils/ethereum"]

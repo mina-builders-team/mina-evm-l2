@@ -1,63 +1,35 @@
 use alloy_eips::BlockId;
-use alloy_primitives::{hex, Address};
-use alloy_signer_local::PrivateKeySigner;
 use anyhow::Result;
-use op_succinct_client_utils::{boot::hash_rollup_config, types::u32_to_u8};
-use op_succinct_host_utils::{
-    fetcher::{OPSuccinctDataFetcher, RPCMode},
-    get_range_elf_embedded, AGGREGATION_ELF,
+use op_succinct_host_utils::fetcher::{OPSuccinctDataFetcher, RPCMode};
+use op_succinct_scripts::config_common::{
+    find_project_root, get_address, get_shared_config_data, get_workspace_root, write_config_file,
+    TWO_WEEKS_IN_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sp1_sdk::{HashableKey, Prover, ProverClient};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::env;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// The config for deploying the OPSuccinctL2OutputOracle.
 /// Note: The fields should be in alphabetical order for Solidity to parse it correctly.
 struct L2OOConfig {
+    aggregation_vkey: String,
     challenger: String,
+    fallback_timeout_secs: u64,
     finalization_period: u64,
     l2_block_time: u64,
     op_succinct_l2_output_oracle_impl: String,
     owner: String,
     proposer: String,
+    proxy_admin: String,
+    range_vkey_commitment: String,
     rollup_config_hash: String,
     starting_block_number: u64,
     starting_output_root: String,
     starting_timestamp: u64,
     submission_interval: u64,
     verifier: String,
-    aggregation_vkey: String,
-    range_vkey_commitment: String,
-    proxy_admin: String,
-}
-
-/// Returns an address based on environment variables and private key settings:
-/// - If env_var exists, returns that address
-/// - Otherwise if private_key_by_default=true and PRIVATE_KEY exists, returns address derived from
-///   private key
-/// - Otherwise returns zero address
-fn get_address(env_var: &str, private_key_by_default: bool) -> String {
-    // First try to get address directly from env var
-    if let Ok(addr) = env::var(env_var) {
-        return addr;
-    }
-
-    // Next try to derive address from private key if enabled
-    if private_key_by_default {
-        if let Ok(pk) = env::var("PRIVATE_KEY") {
-            let signer: PrivateKeySigner = pk.parse().unwrap();
-            return signer.address().to_string();
-        }
-    }
-
-    // Fallback to zero address
-    Address::ZERO.to_string()
 }
 
 /// Update the L2OO config with the rollup config hash and other relevant data before the contract
@@ -75,35 +47,10 @@ fn get_address(env_var: &str, private_key_by_default: bool) -> String {
 /// - owner: Set to the address associated with the private key.
 async fn update_l2oo_config() -> Result<()> {
     let data_fetcher = OPSuccinctDataFetcher::new_with_rollup_config().await?;
-
-    let workspace_root = cargo_metadata::MetadataCommand::new().exec()?.workspace_root;
-
-    // Set the verifier address
-    let verifier = env::var("VERIFIER_ADDRESS").unwrap_or_else(|_| {
-        // Default to Groth16 VerifierGateway contract address
-        // Source: https://docs.succinct.xyz/docs/sp1/verification/contract-addresses
-        "0x397A5f7f3dBd538f23DE225B51f532c34448dA9B".to_string()
-    });
-
-    let starting_block_number = match env::var("STARTING_BLOCK_NUMBER") {
-        Ok(n) => n.parse().unwrap(),
-        Err(_) => data_fetcher.get_l2_header(BlockId::finalized()).await.unwrap().number,
-    };
-
-    let starting_block_number_hex = format!("0x{starting_block_number:x}");
-    let optimism_output_data: Value = data_fetcher
-        .fetch_rpc_data_with_mode(
-            RPCMode::L2Node,
-            "optimism_outputAtBlock",
-            vec![starting_block_number_hex.into()],
-        )
-        .await?;
-
-    let starting_output_root = optimism_output_data["outputRoot"].as_str().unwrap().to_string();
-    let starting_timestamp = optimism_output_data["blockRef"]["timestamp"].as_u64().unwrap();
+    let shared_config = get_shared_config_data().await?;
+    let workspace_root = get_workspace_root()?;
 
     let rollup_config = data_fetcher.rollup_config.as_ref().unwrap();
-    let rollup_config_hash = format!("0x{:x}", hash_rollup_config(rollup_config));
     let l2_block_time = rollup_config.block_time;
 
     let submission_interval =
@@ -125,57 +72,51 @@ async fn update_l2oo_config() -> Result<()> {
     let proxy_admin = get_address("PROXY_ADMIN", false);
     let op_succinct_l2_output_oracle_impl = get_address("OP_SUCCINCT_L2_OUTPUT_ORACLE_IMPL", false);
 
-    let prover = ProverClient::builder().cpu().build();
-    let (_, agg_vkey) = prover.setup(AGGREGATION_ELF);
-    let aggregation_vkey = agg_vkey.vk.bytes32();
+    let fallback_timeout_secs = env::var("FALLBACK_TIMEOUT_SECS")
+        .map(|p| p.parse().unwrap())
+        .unwrap_or(TWO_WEEKS_IN_SECONDS);
 
-    let (_, range_vkey) = prover.setup(get_range_elf_embedded());
+    // Get starting block number - use latest finalized if not set.
+    let starting_block_number = match env::var("STARTING_BLOCK_NUMBER") {
+        Ok(n) => n.parse().unwrap(),
+        Err(_) => data_fetcher.get_l2_header(BlockId::finalized()).await.unwrap().number,
+    };
 
-    let range_vkey_commitment = format!("0x{}", hex::encode(u32_to_u8(range_vkey.vk.hash_u32())));
+    let starting_block_number_hex = format!("0x{starting_block_number:x}");
+    let optimism_output_data: Value = data_fetcher
+        .fetch_rpc_data_with_mode(
+            RPCMode::L2Node,
+            "optimism_outputAtBlock",
+            vec![starting_block_number_hex.into()],
+        )
+        .await?;
+
+    let starting_output_root = optimism_output_data["outputRoot"].as_str().unwrap().to_string();
+    let starting_timestamp = optimism_output_data["blockRef"]["timestamp"].as_u64().unwrap();
 
     let l2oo_config = L2OOConfig {
         challenger,
+        fallback_timeout_secs,
         finalization_period,
         l2_block_time,
         owner,
         proposer,
-        rollup_config_hash,
+        rollup_config_hash: shared_config.rollup_config_hash,
         starting_block_number,
         starting_output_root,
         starting_timestamp,
         submission_interval,
-        verifier,
-        aggregation_vkey,
-        range_vkey_commitment,
+        verifier: shared_config.verifier_address,
+        aggregation_vkey: shared_config.aggregation_vkey,
+        range_vkey_commitment: shared_config.range_vkey_commitment,
         proxy_admin,
         op_succinct_l2_output_oracle_impl,
     };
 
-    write_l2oo_config(l2oo_config, workspace_root.as_std_path())?;
+    let config_path = workspace_root.join("contracts/opsuccinctl2ooconfig.json");
+    write_config_file(&l2oo_config, &config_path, "L2 Output Oracle")?;
 
     Ok(())
-}
-
-/// Write the L2OO rollup config to `contracts/opsuccinctl2ooconfig.json`.
-fn write_l2oo_config(config: L2OOConfig, workspace_root: &Path) -> Result<()> {
-    let opsuccinct_config_path = workspace_root.join("contracts/opsuccinctl2ooconfig.json");
-    // Create parent directories if they don't exist
-    if let Some(parent) = opsuccinct_config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // Write the L2OO rollup config to the opsuccinctl2ooconfig.json file
-    fs::write(&opsuccinct_config_path, serde_json::to_string_pretty(&config)?)?;
-    Ok(())
-}
-
-fn find_project_root() -> Option<PathBuf> {
-    let mut path = std::env::current_dir().ok()?;
-    while !path.join(".git").exists() {
-        if !path.pop() {
-            return None;
-        }
-    }
-    Some(path)
 }
 
 use clap::Parser;
