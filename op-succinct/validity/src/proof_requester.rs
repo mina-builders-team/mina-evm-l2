@@ -9,8 +9,9 @@ use op_succinct_host_utils::{
 };
 use op_succinct_proof_utils::get_range_elf_embedded;
 use sp1_sdk::{
-    network::{proto::network::ExecutionStatus, FulfillmentStrategy},
-    NetworkProver, SP1Proof, SP1ProofMode, SP1ProofWithPublicValues, SP1Stdin, SP1_CIRCUIT_VERSION,
+    network::{proto::types::ExecutionStatus, FulfillmentStrategy, prover::NetworkProver},
+    proof::{SP1Proof, SP1ProofWithPublicValues},
+    CpuProver, SP1ProofMode, SP1Stdin, SP1_CIRCUIT_VERSION,
 };
 use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
@@ -22,7 +23,8 @@ use crate::{
 
 pub struct OPSuccinctProofRequester<H: OPSuccinctHost> {
     pub host: Arc<H>,
-    pub network_prover: Arc<NetworkProver>,
+    pub network_prover: Option<Arc<NetworkProver>>,
+    pub local_prover: Option<Arc<CpuProver>>,
     pub fetcher: Arc<OPSuccinctDataFetcher>,
     pub db_client: Arc<DriverDBClient>,
     pub program_config: ProgramConfig,
@@ -31,13 +33,15 @@ pub struct OPSuccinctProofRequester<H: OPSuccinctHost> {
     pub agg_strategy: FulfillmentStrategy,
     pub agg_mode: SP1ProofMode,
     pub safe_db_fallback: bool,
+    pub use_local_proving: bool,
 }
 
 impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: Arc<H>,
-        network_prover: Arc<NetworkProver>,
+        network_prover: Option<Arc<NetworkProver>>,
+        local_prover: Option<Arc<CpuProver>>,
         fetcher: Arc<OPSuccinctDataFetcher>,
         db_client: Arc<DriverDBClient>,
         program_config: ProgramConfig,
@@ -46,10 +50,12 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         agg_strategy: FulfillmentStrategy,
         agg_mode: SP1ProofMode,
         safe_db_fallback: bool,
+        use_local_proving: bool,
     ) -> Self {
         Self {
             host,
             network_prover,
+            local_prover,
             fetcher,
             db_client,
             program_config,
@@ -58,6 +64,7 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
             agg_strategy,
             agg_mode,
             safe_db_fallback,
+            use_local_proving,
         }
     }
 
@@ -143,10 +150,36 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         Ok(stdin)
     }
 
+    /// Generates a range proof locally.
+    pub async fn generate_local_range_proof(&self, stdin: SP1Stdin) -> Result<SP1ProofWithPublicValues> {
+        let start_time = std::time::Instant::now();
+        let proof = match self
+            .local_prover
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local prover not available"))?
+            .prove(&self.program_config.range_pk, &stdin)
+            .compressed()
+            .run()
+        {
+            Ok(proof) => proof,
+            Err(e) => {
+                ValidityGauge::RangeProofRequestErrorCount.increment(1.0);
+                return Err(e);
+            }
+        };
+        
+        let duration = start_time.elapsed();
+        info!("Generated local range proof in {:.2}s", duration.as_secs_f64());
+        
+        Ok(proof)
+    }
+
     /// Requests a range proof via the network prover.
     pub async fn request_range_proof(&self, stdin: SP1Stdin) -> Result<B256> {
         let proof_id = match self
             .network_prover
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Network prover not available"))?
             .prove(&self.program_config.range_pk, &stdin)
             .compressed()
             .strategy(self.range_strategy)
@@ -165,10 +198,36 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         Ok(proof_id)
     }
 
+    /// Generates an aggregation proof locally.
+    pub async fn generate_local_agg_proof(&self, stdin: SP1Stdin) -> Result<SP1ProofWithPublicValues> {
+        let start_time = std::time::Instant::now();
+        let proof = match self
+            .local_prover
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local prover not available"))?
+            .prove(&self.program_config.agg_pk, &stdin)
+            .mode(self.agg_mode)
+            .run()
+        {
+            Ok(proof) => proof,
+            Err(e) => {
+                ValidityGauge::AggProofRequestErrorCount.increment(1.0);
+                return Err(e);
+            }
+        };
+        
+        let duration = start_time.elapsed();
+        info!("Generated local aggregation proof in {:.2}s", duration.as_secs_f64());
+        
+        Ok(proof)
+    }
+
     /// Requests an aggregation proof via the network prover.
     pub async fn request_agg_proof(&self, stdin: SP1Stdin) -> Result<B256> {
         let proof_id = match self
             .network_prover
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Network prover not available"))?
             .prove(&self.program_config.agg_pk, &stdin)
             .mode(self.agg_mode)
             .strategy(self.agg_strategy)
@@ -200,18 +259,35 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         );
 
         let start_time = Instant::now();
-        let network_prover = self.network_prover.clone();
         // Move the CPU-intensive operation to a dedicated thread.
-        let (pv, report) = match tokio::task::spawn_blocking(move || {
-            network_prover.execute(get_range_elf_embedded(), &stdin).run()
-        })
-        .await?
-        {
-            Ok((pv, report)) => (pv, report),
-            Err(e) => {
-                ValidityGauge::ExecutionErrorCount.increment(1.0);
-                return Err(e);
+        let (pv, report) = if let Some(ref network_prover) = self.network_prover {
+            let network_prover = network_prover.clone();
+            match tokio::task::spawn_blocking(move || {
+                network_prover.execute(get_range_elf_embedded(), &stdin).run()
+            })
+            .await?
+            {
+                Ok((pv, report)) => (pv, report),
+                Err(e) => {
+                    ValidityGauge::ExecutionErrorCount.increment(1.0);
+                    return Err(e);
+                }
             }
+        } else if let Some(ref local_prover) = self.local_prover {
+            let local_prover = local_prover.clone();
+            match tokio::task::spawn_blocking(move || {
+                local_prover.execute(get_range_elf_embedded(), &stdin).run()
+            })
+            .await?
+            {
+                Ok((pv, report)) => (pv, report),
+                Err(e) => {
+                    ValidityGauge::ExecutionErrorCount.increment(1.0);
+                    return Err(e);
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("No prover available"));
         };
 
         let execution_duration = start_time.elapsed().as_secs();
@@ -251,18 +327,35 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
         stdin: SP1Stdin,
     ) -> Result<SP1ProofWithPublicValues> {
         let start_time = Instant::now();
-        let network_prover = self.network_prover.clone();
         // Move the CPU-intensive operation to a dedicated thread.
-        let (pv, report) = match tokio::task::spawn_blocking(move || {
-            network_prover.execute(AGGREGATION_ELF, &stdin).deferred_proof_verification(false).run()
-        })
-        .await?
-        {
-            Ok((pv, report)) => (pv, report),
-            Err(e) => {
-                ValidityGauge::ExecutionErrorCount.increment(1.0);
-                return Err(e);
+        let (pv, report) = if let Some(ref network_prover) = self.network_prover {
+            let network_prover = network_prover.clone();
+            match tokio::task::spawn_blocking(move || {
+                network_prover.execute(AGGREGATION_ELF, &stdin).deferred_proof_verification(false).run()
+            })
+            .await?
+            {
+                Ok((pv, report)) => (pv, report),
+                Err(e) => {
+                    ValidityGauge::ExecutionErrorCount.increment(1.0);
+                    return Err(e);
+                }
             }
+        } else if let Some(ref local_prover) = self.local_prover {
+            let local_prover = local_prover.clone();
+            match tokio::task::spawn_blocking(move || {
+                local_prover.execute(AGGREGATION_ELF, &stdin).deferred_proof_verification(false).run()
+            })
+            .await?
+            {
+                Ok((pv, report)) => (pv, report),
+                Err(e) => {
+                    ValidityGauge::ExecutionErrorCount.increment(1.0);
+                    return Err(e);
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("No prover available"));
         };
 
         let execution_duration = start_time.elapsed().as_secs();
@@ -447,6 +540,10 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
                     let proof = self.generate_mock_range_proof(&request, stdin).await?;
                     let proof_bytes = bincode::serialize(&proof).unwrap();
                     self.db_client.update_proof_to_complete(request.id, &proof_bytes).await?;
+                } else if self.use_local_proving {
+                    let proof = self.generate_local_range_proof(stdin).await?;
+                    let proof_bytes = bincode::serialize(&proof).unwrap();
+                    self.db_client.update_proof_to_complete(request.id, &proof_bytes).await?;
                 } else {
                     let proof_id = self.request_range_proof(stdin).await?;
                     self.db_client.update_request_to_prove(request.id, proof_id).await?;
@@ -455,6 +552,9 @@ impl<H: OPSuccinctHost> OPSuccinctProofRequester<H> {
             RequestType::Aggregation => {
                 if self.mock {
                     let proof = self.generate_mock_agg_proof(&request, stdin).await?;
+                    self.db_client.update_proof_to_complete(request.id, &proof.bytes()).await?;
+                } else if self.use_local_proving {
+                    let proof = self.generate_local_agg_proof(stdin).await?;
                     self.db_client.update_proof_to_complete(request.id, &proof.bytes()).await?;
                 } else {
                     let proof_id = self.request_agg_proof(stdin).await?;

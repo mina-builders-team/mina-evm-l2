@@ -16,8 +16,11 @@ use op_succinct_host_utils::{
 use op_succinct_proof_utils::get_range_elf_embedded;
 use op_succinct_signer_utils::Signer;
 use sp1_sdk::{
-    network::proto::network::{ExecutionStatus, FulfillmentStatus},
-    HashableKey, NetworkProver, Prover, ProverClient, SP1Proof, SP1ProofWithPublicValues,
+    network::{proto::types::{ExecutionStatus, FulfillmentStatus}, prover::NetworkProver},
+    client::ProverClient,
+    prover::Prover,
+    proof::{SP1Proof, SP1ProofWithPublicValues},
+    CpuProver, HashableKey, SP1ProvingKey, SP1VerifyingKey,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -30,7 +33,8 @@ use crate::{
 
 /// Configuration for the driver.
 pub struct DriverConfig {
-    pub network_prover: Arc<NetworkProver>,
+    pub network_prover: Option<Arc<NetworkProver>>,
+    pub local_prover: Option<Arc<CpuProver>>,
     pub fetcher: Arc<OPSuccinctDataFetcher>,
     pub driver_db_client: Arc<DriverDBClient>,
     pub signer: Signer,
@@ -84,20 +88,35 @@ where
             .add_chain_lock(requester_config.l1_chain_id, requester_config.l2_chain_id)
             .await?;
 
-        // Set a default network private key to avoid an error in mock mode.
-        let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
-            tracing::warn!(
-                "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
-            );
-            "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
-        });
+        let (network_prover, local_prover) = if requester_config.use_local_proving {
+            (None, Some(Arc::new(CpuProver::new())))
+        } else {
+            // Set a default network private key to avoid an error in mock mode.
+            let private_key = env::var("NETWORK_PRIVATE_KEY").unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Using default NETWORK_PRIVATE_KEY of 0x01. This is only valid in mock mode."
+                );
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            });
 
-        let network_prover =
-            Arc::new(ProverClient::builder().network().private_key(&private_key).build());
+            (Some(Arc::new(ProverClient::builder().network().private_key(&private_key).build())), None)
+        };
 
-        let (range_pk, range_vk) = network_prover.setup(get_range_elf_embedded());
+        let (range_pk, range_vk): (SP1ProvingKey, SP1VerifyingKey) = if let Some(ref network_prover) = network_prover {
+            network_prover.setup(get_range_elf_embedded())
+        } else if let Some(ref local_prover) = local_prover {
+            local_prover.setup(get_range_elf_embedded())
+        } else {
+            unreachable!("Either network or local prover must be set")
+        };
 
-        let (agg_pk, agg_vk) = network_prover.setup(AGGREGATION_ELF);
+        let (agg_pk, agg_vk): (SP1ProvingKey, SP1VerifyingKey) = if let Some(ref network_prover) = network_prover {
+            network_prover.setup(AGGREGATION_ELF)
+        } else if let Some(ref local_prover) = local_prover {
+            local_prover.setup(AGGREGATION_ELF)
+        } else {
+            unreachable!("Either network or local prover must be set")
+        };
         let multi_block_vkey_u8 = u32_to_u8(range_vk.vk.hash_u32());
         let range_vkey_commitment = B256::from(multi_block_vkey_u8);
         let agg_vkey_hash = B256::from_str(&agg_vk.bytes32()).unwrap();
@@ -121,6 +140,7 @@ where
         let proof_requester = Arc::new(OPSuccinctProofRequester::new(
             host,
             network_prover.clone(),
+            local_prover.clone(),
             fetcher.clone(),
             db_client.clone(),
             program_config.clone(),
@@ -129,6 +149,7 @@ where
             requester_config.agg_proof_strategy,
             requester_config.agg_proof_mode,
             requester_config.safe_db_fallback,
+            requester_config.use_local_proving,
         ));
 
         let l2oo_contract =
@@ -140,6 +161,7 @@ where
         let proposer = Proposer {
             driver_config: DriverConfig {
                 network_prover,
+                local_prover,
                 fetcher,
                 driver_db_client: db_client,
                 signer,
@@ -258,6 +280,11 @@ where
     /// Handle all proof requests in the Prove state.
     #[tracing::instrument(name = "proposer.handle_proving_requests", skip(self))]
     pub async fn handle_proving_requests(&self) -> Result<()> {
+        // For local proving, proofs are completed immediately so this step is skipped
+        if self.requester_config.use_local_proving {
+            return Ok(());
+        }
+
         // Get all requests from the database.
         let prove_requests = self
             .driver_config
@@ -282,9 +309,19 @@ where
     #[tracing::instrument(name = "proposer.process_proof_request_status", skip(self, request))]
     pub async fn process_proof_request_status(&self, request: OPSuccinctRequest) -> Result<()> {
         if let Some(proof_request_id) = request.proof_request_id.as_ref() {
-            let (status, proof) = self
-                .driver_config
-                .network_prover
+            // For local proving, proofs are generated synchronously and should already be complete
+            if self.requester_config.use_local_proving {
+                // Local proofs should be completed immediately after generation
+                // This function should not be called for local proving mode
+                tracing::warn!("process_proof_request_status called for local proving mode request {}", request.id);
+                return Ok(());
+            }
+
+            // Network proving path - check status with network prover
+            let network_prover = self.driver_config.network_prover.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Expected NetworkProver for network proving mode"))?;
+            
+            let (status, proof) = network_prover
                 .get_proof_status(B256::from_slice(proof_request_id))
                 .await?;
 

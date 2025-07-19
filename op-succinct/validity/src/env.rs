@@ -26,6 +26,7 @@ pub struct EnvironmentConfig {
     pub mock: bool,
     pub safe_db_fallback: bool,
     pub op_succinct_config_name: String,
+    pub use_local_proving: bool,
 }
 
 /// Helper function to get environment variables with a default value and parse them.
@@ -111,6 +112,7 @@ pub fn read_proposer_env() -> Result<EnvironmentConfig> {
             "OP_SUCCINCT_CONFIG_NAME",
             Some("opsuccinct_genesis".to_string()),
         )?,
+        use_local_proving: get_env_var("USE_LOCAL_PROVING", Some(false))?,
     };
 
     Ok(config)

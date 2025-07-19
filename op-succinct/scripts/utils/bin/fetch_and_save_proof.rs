@@ -4,8 +4,9 @@ use anyhow::Result;
 use clap::Parser;
 use op_succinct_client_utils::{boot::BootInfoStruct, AGGREGATION_OUTPUTS_SIZE};
 use sp1_sdk::{
-    network::proto::network::{ExecutionStatus, FulfillmentStatus, GetProofRequestStatusResponse},
-    ProverClient, SP1ProofWithPublicValues,
+    network::proto::types::{ExecutionStatus, FulfillmentStatus, GetProofRequestStatusResponse},
+    client::ProverClient, 
+    proof::SP1ProofWithPublicValues,
 };
 use std::{fs, path::Path};
 
