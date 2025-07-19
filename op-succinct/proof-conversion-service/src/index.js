@@ -122,16 +122,25 @@ class ProofConversionService {
       console.log(`🔄 Converting ${fileName} using sp1-proof-to-json binary...`);
       
       try {
-        await execFileAsync('/usr/local/bin/sp1-proof-to-json', [
+        // Try local binary first (built with updated SP1 v5.0.0)
+        await execFileAsync('./bin/sp1-proof-to-json', [
           '-i', filePath,
           '-o', tempOutputPath
         ]);
       } catch (execError) {
-        // Fallback to relative path if absolute path fails
-        await execFileAsync('./target/release/sp1-proof-to-json', [
-          '-i', filePath, 
-          '-o', tempOutputPath
-        ]);
+        try {
+          // Fallback to global binary
+          await execFileAsync('/usr/local/bin/sp1-proof-to-json', [
+            '-i', filePath,
+            '-o', tempOutputPath
+          ]);
+        } catch (execError2) {
+          // Final fallback to relative path
+          await execFileAsync('./target/release/sp1-proof-to-json', [
+            '-i', filePath, 
+            '-o', tempOutputPath
+          ]);
+        }
       }
 
       // Read the converted JSON

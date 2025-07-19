@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
             }
         },
         "boot_info": boot_info_json,
-        "sp1_version": "v4.0.0-rc.3",
+        "sp1_version": "v5.0.0",
         "metadata": {
             "original_file": args.input,
             "file_size": fs::metadata(&args.input)?.len(),
